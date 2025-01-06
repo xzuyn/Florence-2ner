@@ -11,6 +11,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, Sequ
 import multiprocessing
 import shutil
 import random
+import gc
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -36,7 +37,8 @@ config = {
     "eval_steps": 50,
     "warmup_steps": 50,
     "eval_split_ratio": 0.1,
-    "seed": 42
+    "seed": 42,
+    "filtering_processes": 128
 }
 
 
@@ -73,7 +75,7 @@ def collate_fn(batch, processor):
             images=validated_images,
             return_tensors="pt",
             padding=True,
-        ).to(device, torch.bfloat16)
+        ).to(device, torch.float16)
     except ValueError as e:
         print(f"Processor error: {e}")
         raise
@@ -138,6 +140,7 @@ def train_model(train_loader, val_loader, model, processor, config):
 
             for i, batch in enumerate(train_loader):
                 torch.cuda.empty_cache()
+                gc.collect()
                 inputs, answers = batch
                 labels = tokenizer(
                     text=answers,
@@ -193,6 +196,7 @@ def evaluate_model(val_loader, model, processor, run, current_step):
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validation"):
             torch.cuda.empty_cache()
+            gc.collect()
             inputs, answers = batch
             labels = tokenizer(
                 text=answers,
@@ -265,10 +269,25 @@ def save_model_checkpoint(model, processor, run_name, step, save_total_limit):
             shutil.rmtree(checkpoint_to_delete)
 
 
+def filter_data_chunk(chunk, processor):
+    filtered_chunk = []
+    tokenizer = processor.tokenizer
+    for img_path, txt_path in chunk:
+        try:
+            with open(txt_path, "r") as f:
+                text = f.read().strip()
+            inputs = tokenizer(text, return_tensors="pt")
+            if inputs.input_ids.shape[1] <= 1000:
+                filtered_chunk.append((img_path, txt_path))
+        except Exception as e:
+            print(f"Error processing {txt_path}: {e}")
+    return filtered_chunk
+
+
 # Initialize components
 model = AutoModelForCausalLM.from_pretrained(
     config["model_name"],
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.float16,
     trust_remote_code=True,
     attn_implementation="sdpa",
 ).to(device)
@@ -303,6 +322,23 @@ all_files = [
     (img_file, img_file.with_suffix(".txt")) for img_file in dataset_path.iterdir()
     if img_file.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and img_file.with_suffix(".txt").exists()
 ]
+
+gc.collect()
+
+# Optimized filtering using multiprocessing
+print("Filtering data based on token length using multiprocessing...")
+with multiprocessing.Pool(processes=config["filtering_processes"]) as pool:
+    chunk_size = max(1, len(all_files) // config["filtering_processes"])
+    chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
+    results = list(tqdm(pool.starmap(filter_data_chunk, [(chunk, processor) for chunk in chunks]), total=len(chunks)))
+
+gc.collect()
+
+filtered_files = [item for sublist in results for item in sublist]
+
+print(f"Filtered out {len(all_files) - len(filtered_files)} files due to token length.")
+all_files = filtered_files
+
 random.shuffle(all_files)
 eval_size = int(len(all_files) * config["eval_split_ratio"])
 eval_dataset_pairs = all_files[:eval_size]
@@ -322,6 +358,9 @@ val_loader = DataLoader(
     batch_size=config["eval_batch_size"],
     collate_fn=lambda batch: collate_fn(batch, processor),
 )
+
+torch.cuda.empty_cache()
+gc.collect()
 
 # Train the model
 train_model(train_loader, val_loader, model, processor, config)
