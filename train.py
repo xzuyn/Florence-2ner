@@ -10,6 +10,7 @@ from optimi import AdamW as OptimiAdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 import multiprocessing
 import shutil
+import random
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -33,29 +34,26 @@ config = {
     "save_steps": 50,
     "save_total_limit": 3,
     "eval_steps": 50,
-    "warmup_steps": 50
+    "warmup_steps": 50,
+    "eval_split_ratio": 0.1,
+    "seed": 42
 }
 
 
 class LocalImageTextDataset(Dataset):
-    def __init__(self, folder_path, task_prompt="<CAPTION>"):  # Change to whatever
-        self.folder_path = Path(folder_path)
-        self.data = [
-            (file, file.with_suffix(".txt"))
-            for file in self.folder_path.iterdir()
-            if file.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and file.with_suffix(".txt").exists()
-        ]
+    def __init__(self, data_pairs, task_prompt="<CAPTION>"):
+        self.data_pairs = data_pairs
         self.task_prompt = task_prompt
 
     def __len__(self):
-        return len(self.data)
+        return len(self.data_pairs)
 
     def __getitem__(self, idx):
-        image_path, prompt_path = self.data[idx]
+        image_path, prompt_path = self.data_pairs[idx]
         try:
             image = Image.open(image_path)
             if image.mode != "RGB":
-                image = image.convert("RGB")  # Ensure the image has 3 channels
+                image = image.convert("RGB")
             with open(prompt_path, "r") as f:
                 answer = f.read().strip()
             return self.task_prompt, answer, image
@@ -295,8 +293,23 @@ if config["freeze_other"]:
     image_proj_norm.weight.requires_grad = False
     image_projection.requires_grad = False
 
-train_dataset = LocalImageTextDataset(f"{config['dataset_path']}/train")
-val_dataset = LocalImageTextDataset(f"{config['dataset_path']}/eval")
+random.seed(config["seed"])
+torch.manual_seed(config["seed"])
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(config["seed"])
+
+dataset_path = Path(config["dataset_path"])
+all_files = [
+    (img_file, img_file.with_suffix(".txt")) for img_file in dataset_path.iterdir()
+    if img_file.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and img_file.with_suffix(".txt").exists()
+]
+random.shuffle(all_files)
+eval_size = int(len(all_files) * config["eval_split_ratio"])
+eval_dataset_pairs = all_files[:eval_size]
+train_dataset_pairs = all_files[eval_size:]
+
+train_dataset = LocalImageTextDataset(train_dataset_pairs)
+val_dataset = LocalImageTextDataset(eval_dataset_pairs)
 
 train_loader = DataLoader(
     train_dataset,
