@@ -1,0 +1,7 @@
+torch
+torchvision
+transformers
+torch-optimi
+wandb
+pillow
+tqdm
