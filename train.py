@@ -21,15 +21,15 @@ config = {
     "model_name": "microsoft/Florence-2-base",
     "dataset_path": "",
     "run_name": "",
-    "epochs": 2,  # I found 3 or more to start overfitting. 1 or 2 is a good default.
+    "epochs": 1,  # I found 3 or more to start overfitting. 1 or 2 is a good default.
     "learning_rate": 1e-5,
     "gradient_checkpointing": True,  # May have no effect
-    "freeze_vision": True,
+    "freeze_vision": False,
     "freeze_language": False,
     "freeze_other": False,
-    "train_batch_size": 16,
+    "train_batch_size": 8,
     "eval_batch_size": 16,
-    "gradient_accumulation_steps": 16,
+    "gradient_accumulation_steps": 32,
     "clip_grad_norm": 1,
     "weight_decay": 1e-5,  # 1e-5 default. Not sure if it should be higher or lower.
     "save_steps": 50,
@@ -75,7 +75,7 @@ def collate_fn(batch, processor):
             images=validated_images,
             return_tensors="pt",
             padding=True,
-        ).to(device, torch.float16)
+        ).to(device, torch.bfloat16)
     except ValueError as e:
         print(f"Processor error: {e}")
         raise
@@ -146,6 +146,7 @@ def train_model(train_loader, val_loader, model, processor, config):
                     text=answers,
                     return_tensors="pt",
                     padding=True,
+                    return_token_type_ids=False,
                 ).input_ids.to(device)
 
                 # Create attention mask to ignore padding tokens
@@ -287,7 +288,7 @@ def filter_data_chunk(chunk, processor):
 # Initialize components
 model = AutoModelForCausalLM.from_pretrained(
     config["model_name"],
-    torch_dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     trust_remote_code=True,
     attn_implementation="sdpa",
 ).to(device)
@@ -351,12 +352,12 @@ train_loader = DataLoader(
     train_dataset,
     batch_size=config["train_batch_size"],
     collate_fn=lambda batch: collate_fn(batch, processor),
-    shuffle=True,
+    shuffle=True
 )
 val_loader = DataLoader(
     val_dataset,
     batch_size=config["eval_batch_size"],
-    collate_fn=lambda batch: collate_fn(batch, processor),
+    collate_fn=lambda batch: collate_fn(batch, processor)
 )
 
 torch.cuda.empty_cache()
