@@ -1,17 +1,25 @@
 import os
-from pathlib import Path
-import torch
-import wandb
-from tqdm import tqdm
-from torch.utils.data import DataLoader, Dataset
-from transformers import AutoModelForCausalLM, AutoProcessor
-from PIL import Image
-from optimi import AdamW as OptimiAdamW
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
-import multiprocessing
-import shutil
-import random
 import gc
+import json
+import random
+import multiprocessing
+from pathlib import Path
+import shutil
+
+from PIL import Image
+from tqdm import tqdm
+
+import wandb
+import torch
+from torch.utils.data import DataLoader, Dataset
+from torch.optim.lr_scheduler import (
+    CosineAnnealingWarmRestarts,
+    LinearLR,
+    SequentialLR,
+)
+from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
+from optimi import AdamW as OptimiAdamW
+
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -255,12 +263,18 @@ def evaluate_model(val_loader, model, processor, run, current_step):
     run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
 
 
-# TODO: Fix model.config.vision_config.model_type not saving as "davit"
 def save_model_checkpoint(model, processor, run_name, step, save_total_limit):
     output_dir = f"./checkpoints/{run_name}/step-{step}"
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
     processor.save_pretrained(output_dir)
+
+    # Workaround for vision_config
+    with open(f"{output_dir}/config.json", "r+") as f:
+        data = json.load(f)
+    data["vision_config"]["model_type"] = "davit"
+    with open(f"{output_dir}/config.json", "w") as f:
+        json.dump(data, f, indent=2)
 
     # Implement save_total_limit
     checkpoint_dir = Path(f"./checkpoints/{run_name}")
