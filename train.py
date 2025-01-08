@@ -32,13 +32,14 @@ config = {
     "gradient_accumulation_steps": 32,
     "clip_grad_norm": 1,
     "weight_decay": 1e-5,  # 1e-5 default. Not sure if it should be higher or lower.
-    "save_steps": 50,
     "save_total_limit": 3,
+    "save_steps": 50,
     "eval_steps": 50,
     "warmup_steps": 50,
     "eval_split_ratio": 0.1,
     "seed": 42,
-    "filtering_processes": 128
+    "filtering_processes": 128,
+    "attn_implementation": "sdpa"
 }
 
 
@@ -254,6 +255,7 @@ def evaluate_model(val_loader, model, processor, run, current_step):
     run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
 
 
+# TODO: Fix model.config.vision_config.model_type not saving as "davit"
 def save_model_checkpoint(model, processor, run_name, step, save_total_limit):
     output_dir = f"./checkpoints/{run_name}/step-{step}"
     os.makedirs(output_dir, exist_ok=True)
@@ -290,7 +292,7 @@ model = AutoModelForCausalLM.from_pretrained(
     config["model_name"],
     torch_dtype=torch.bfloat16,
     trust_remote_code=True,
-    attn_implementation="sdpa",
+    attn_implementation=config["attn_implementation"],
 ).to(device)
 processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
 
