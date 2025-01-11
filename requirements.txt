@@ -1,7 +1,7 @@
 torch
 torchvision
 transformers
-bitsandbytes
+torch-optimi
 wandb
 pillow
 tqdm
