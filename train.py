@@ -184,7 +184,6 @@ def train_model(train_loader, val_loader, model, processor, config):
                         {
                             "train/loss": loss.item() * config["gradient_accumulation_steps"],
                             "train/grad_norm": grad_norm.item(),
-                            "train/weight_norm": weight_norm,
                             "lr": optimizer.param_groups[0]["lr"]
                         }
                     )
