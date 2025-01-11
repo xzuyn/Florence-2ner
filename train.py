@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     SequentialLR,
 )
-from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
+from transformers import AutoModelForCausalLM, AutoProcessor
 from optimi import AdamW as OptimiAdamW
 
 
@@ -92,6 +92,7 @@ def collate_fn(batch, processor):
 
 
 def train_model(train_loader, val_loader, model, processor, config):
+    # TODO: Add support for choosing other optimizers such as CAME and PagedAdEMAMix8bit
     optimizer = OptimiAdamW(
         model.parameters(),
         lr=config["learning_rate"],
@@ -171,26 +172,46 @@ def train_model(train_loader, val_loader, model, processor, config):
                 if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
                     torch.cuda.empty_cache()
                     gc.collect()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
+
                     current_step += 1
                     progress_bar.update(1)
 
                     run.log(
                         {
                             "train/loss": loss.item() * config["gradient_accumulation_steps"],
+                            "train/grad_norm": grad_norm.item(),
+                            "train/weight_norm": weight_norm,
                             "lr": optimizer.param_groups[0]["lr"]
                         }
                     )
-                    progress_bar.set_postfix({"loss": loss.item() * config["gradient_accumulation_steps"]})
+                    progress_bar.set_postfix(
+                        {
+                            "loss": loss.item() * config["gradient_accumulation_steps"],
+                            "grad_norm": grad_norm.item()
+                        }
+                    )
 
                     if current_step % config["eval_steps"] == 0:
-                        evaluate_model(val_loader, model, processor, run, current_step)
+                        evaluate_model(
+                            val_loader,
+                            model,
+                            processor,
+                            run,
+                            current_step
+                        )
 
                     if current_step % config["save_steps"] == 0:
-                        save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
+                        save_model_checkpoint(
+                            model,
+                            processor,
+                            config["run_name"],
+                            current_step,
+                            config["save_total_limit"]
+                        )
 
         # Save the last checkpoint
         save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
