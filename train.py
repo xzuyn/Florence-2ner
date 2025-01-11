@@ -18,8 +18,7 @@ from torch.optim.lr_scheduler import (
     SequentialLR,
 )
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
-from bitsandbytes.optim import PagedAdamW8bit
-
+from optimi import AdamW as OptimiAdamW
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,6 +38,7 @@ config = {
     "eval_batch_size": 16,
     "gradient_accumulation_steps": 32,
     "clip_grad_norm": 1,
+    "weight_decay": 1e-5,  # 1e-5 default. Not sure if it should be higher or lower.
     "save_total_limit": 3,
     "save_steps": 50,
     "eval_steps": 50,
@@ -92,7 +92,12 @@ def collate_fn(batch, processor):
 
 
 def train_model(train_loader, val_loader, model, processor, config):
-    optimizer = PagedAdamW8bit(model.parameters(), lr=config["learning_rate"])
+    optimizer = OptimiAdamW(
+        model.parameters(),
+        lr=config["learning_rate"],
+        weight_decay=config["weight_decay"],
+        decouple_lr=True
+    )
     tokenizer = processor.tokenizer
 
     # Calculate total training steps
