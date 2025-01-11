@@ -18,7 +18,7 @@ from torch.optim.lr_scheduler import (
     SequentialLR,
 )
 from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
-from optimi import AdamW as OptimiAdamW
+from bitsandbytes.optim import PagedAdamW8bit
 
 
 
@@ -39,7 +39,6 @@ config = {
     "eval_batch_size": 16,
     "gradient_accumulation_steps": 32,
     "clip_grad_norm": 1,
-    "weight_decay": 1e-5,  # 1e-5 default. Not sure if it should be higher or lower.
     "save_total_limit": 3,
     "save_steps": 50,
     "eval_steps": 50,
@@ -93,12 +92,7 @@ def collate_fn(batch, processor):
 
 
 def train_model(train_loader, val_loader, model, processor, config):
-    optimizer = OptimiAdamW(
-        model.parameters(),
-        lr=config["learning_rate"],
-        weight_decay=config["weight_decay"],
-        decouple_lr=True
-    )
+    optimizer = PagedAdamW8bit(model.parameters(), lr=config["learning_rate"])
     tokenizer = processor.tokenizer
 
     # Calculate total training steps
@@ -148,8 +142,6 @@ def train_model(train_loader, val_loader, model, processor, config):
             optimizer.zero_grad() # Initialize gradients outside the inner loop
 
             for i, batch in enumerate(train_loader):
-                torch.cuda.empty_cache()
-                gc.collect()
                 inputs, answers = batch
                 labels = tokenizer(
                     text=answers,
@@ -172,6 +164,8 @@ def train_model(train_loader, val_loader, model, processor, config):
                 loss.backward()
 
                 if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
+                    torch.cuda.empty_cache()
+                    gc.collect()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
                     optimizer.step()
                     scheduler.step()
@@ -270,7 +264,7 @@ def save_model_checkpoint(model, processor, run_name, step, save_total_limit):
     processor.save_pretrained(output_dir)
 
     # Workaround for vision_config
-    with open(f"{output_dir}/config.json", "r+") as f:
+    with open(f"{output_dir}/config.json", "r") as f:
         data = json.load(f)
     data["vision_config"]["model_type"] = "davit"
     with open(f"{output_dir}/config.json", "w") as f:
