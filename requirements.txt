@@ -2,6 +2,7 @@ torch
 torchvision
 transformers
 torch-optimi
+came-pytorch
 wandb
 pillow
 tqdm
