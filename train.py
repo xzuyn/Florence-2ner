@@ -13,9 +13,11 @@ import wandb
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import (
-    CosineAnnealingWarmRestarts,
+    ConstantLR,
+    CosineAnnealingLR,
     LinearLR,
     SequentialLR,
+    _LRScheduler
 )
 from transformers import AutoModelForCausalLM, AutoProcessor
 
@@ -30,8 +32,9 @@ config = {
     "wandb_project_name": "Florence-2-base",
     "run_name": "",
     "epochs": 1,  # I found 3 or more to start overfitting. 1 or 2 is a good default
-    "optimizer": "OptimiAdamW",  # Currently only supports "OptimiAdamW" & "CAME"
-    "learning_rate": 1e-5,
+    "optimizer": "CAME",  # Currently supports "OptimiAdamW" & "CAME"
+    "learning_rate": 1e-6,
+    "lr_scheduler": "REX",  # Currently supports "Constant", "Cosine", and "REX"
     "gradient_checkpointing": True,  # May have no effect
     "freeze_vision": False,
     "freeze_language": False,
@@ -40,7 +43,7 @@ config = {
     "eval_batch_size": 8,
     "gradient_accumulation_steps": 32,
     "clip_grad_norm": 1,
-    "weight_decay": 1e-5,  # 1e-5 default for OptimiAdamW, 1e-2 default for CAME
+    "weight_decay": 1e-2,  # 1e-5 default for OptimiAdamW, 1e-2 default for CAME
     "save_total_limit": 3,
     "save_steps": 50,
     "eval_steps": 50,
@@ -71,6 +74,25 @@ class LocalImageTextDataset(Dataset):
             return self.task_prompt, answer, image
         except Exception as e:
             raise RuntimeError(f"Error loading data from {image_path}: {e}")
+
+
+# https://github.com/IvanVassi/REX_LR
+class RexLR(_LRScheduler):
+    def __init__(self, optimizer, max_val, min_val, num_epochs=1, last_epoch=-1):
+        self.num_epochs = num_epochs
+        self.min_val = min_val
+        self.max_val = max_val
+        if not self.min_val <= self.max_val:
+            raise ValueError('Value of "min_val" should be less '
+                             ' than value of "max_val". Got min_val=' + str(min_val) + ' and max_val=' + str(max_val))
+
+        super(RexLR, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        mod_iter = float(self.last_epoch % self.num_epochs)
+        z = float(self.num_epochs - mod_iter) / self.num_epochs
+        val = self.min_val + float(self.max_val - self.min_val) * (z / (1 - 0.9 + 0.9 * z))
+        return [val]
 
 
 def collate_fn(batch, processor):
@@ -118,7 +140,12 @@ def verify_optimizer_choice(optimizer_choice):
 # TODO: Add more optimizers
 # https://github.com/warner-benjamin/optimi
 # https://github.com/yangluo7/CAME
-def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_weight_decay):
+def prepare_optimizer(
+    model_parameters,
+    optimizer_name,
+    optimizer_lr,
+    optimizer_weight_decay
+):
     if optimizer_name == "OptimiAdamW":
         optimizer = OptimiAdamW(
             model_parameters,
@@ -144,31 +171,63 @@ def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_
 
 
 # TODO: Add more LR schedulers
-def prepare_lr_scheduler(scheduler_optimizer, scheduler_warmup_steps, scheduler_total_training_steps):
+# TODO: Properly solve learning rate spiking on last few steps
+def prepare_lr_scheduler(
+    scheduler_optimizer,
+    scheduler_name,
+    scheduler_lr,
+    scheduler_warmup_steps,
+    scheduler_total_training_steps
+):
     warmup_scheduler = LinearLR(
         scheduler_optimizer,
-        start_factor=1e-10,
+        start_factor=1e-20,
         end_factor=1.0,
         total_iters=scheduler_warmup_steps
     )
-    cosine_scheduler = CosineAnnealingWarmRestarts(
-        scheduler_optimizer,
-        T_0=(scheduler_total_training_steps - scheduler_warmup_steps) + 2,  # Add 2 to prevent it from spiking on the last step
-    )
+
+    if scheduler_name == "Constant":
+        main_scheduler = ConstantLR(
+            scheduler_optimizer
+        )
+    elif scheduler_name == "Cosine":
+        main_scheduler = CosineAnnealingLR(
+            scheduler_optimizer,
+            T_max=(scheduler_total_training_steps - scheduler_warmup_steps) + 1
+        )
+    elif scheduler_name == "REX":
+        main_scheduler = RexLR(
+            scheduler_optimizer,
+            max_val=scheduler_lr,
+            min_val=0,
+            num_epochs=(scheduler_total_training_steps - scheduler_warmup_steps) + 1
+        )
+    else:
+        print("No valid LR scheduler selected. Falling back to Cosine.")
+        main_scheduler = CosineAnnealingLR(
+            scheduler_optimizer,
+            T_max=(scheduler_total_training_steps - scheduler_warmup_steps) + 1
+        )
 
     if scheduler_warmup_steps > 0:
         scheduler = SequentialLR(
             scheduler_optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
+            schedulers=[warmup_scheduler, main_scheduler],
             milestones=[scheduler_warmup_steps]
         )
     else:
-        scheduler = cosine_scheduler
+        scheduler = main_scheduler
 
     return scheduler
 
 
-def train_model(train_loader, val_loader, model, processor, config):
+def train_model(
+    train_loader,
+    val_loader,
+    model,
+    processor,
+    config
+):
     tokenizer = processor.tokenizer
     optimizer = prepare_optimizer(
         model.parameters(),
@@ -182,7 +241,13 @@ def train_model(train_loader, val_loader, model, processor, config):
     if len(train_loader) % config["gradient_accumulation_steps"] != 0:
         total_training_steps += 1
 
-    scheduler = prepare_lr_scheduler(optimizer, config["warmup_steps"], total_training_steps)
+    scheduler = prepare_lr_scheduler(
+        optimizer,
+        config["lr_scheduler"],
+        config["learning_rate"],
+        config["warmup_steps"],
+        total_training_steps
+    )
 
     current_step = 0
     with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
@@ -267,11 +332,27 @@ def train_model(train_loader, val_loader, model, processor, config):
                             config["save_total_limit"]
                         )
 
+        # Eval the last step if it hasn't been already
+        if current_step % config["eval_steps"] != 0:
+            evaluate_model(
+                val_loader,
+                model,
+                processor,
+                run,
+                current_step
+            )
+
         # Save the last checkpoint
         save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
 
 
-def evaluate_model(val_loader, model, processor, run, current_step):
+def evaluate_model(
+    val_loader,
+    model,
+    processor,
+    run,
+    current_step
+):
     model.eval()
     tokenizer = processor.tokenizer
     total_loss = 0
@@ -337,7 +418,13 @@ def evaluate_model(val_loader, model, processor, run, current_step):
     run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
 
 
-def save_model_checkpoint(model, processor, run_name, step, save_total_limit):
+def save_model_checkpoint(
+    model,
+    processor,
+    run_name,
+    step,
+    save_total_limit
+):
     output_dir = f"./checkpoints/{run_name}/step-{step}"
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
