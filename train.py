@@ -26,6 +26,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Configuration parameters
 config = {
     "model_name": "microsoft/Florence-2-base",
+    "task_prompt": "<CAPTION>",
     "dataset_path": "",
     "wandb_project_name": "Florence-2-base",
     "run_name": "",
@@ -52,7 +53,7 @@ config = {
 
 
 class LocalImageTextDataset(Dataset):
-    def __init__(self, data_pairs, task_prompt="<CAPTION>"):
+    def __init__(self, data_pairs, task_prompt=config["task_prompt"]):
         self.data_pairs = data_pairs
         self.task_prompt = task_prompt
 
@@ -316,7 +317,7 @@ def filter_data_chunk(chunk, processor):
             with open(txt_path, "r") as f:
                 text = f.read().strip()
             inputs = tokenizer(text, return_tensors="pt")
-            if inputs.input_ids.shape[1] <= 1000:
+            if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
                 filtered_chunk.append((img_path, txt_path))
         except Exception as e:
             print(f"Error processing {txt_path}: {e}")
