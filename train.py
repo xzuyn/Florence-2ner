@@ -147,7 +147,7 @@ def train_model(train_loader, val_loader, model, processor, config):
                 ),
                 desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]"
             )
-            optimizer.zero_grad() # Initialize gradients outside the inner loop
+            optimizer.zero_grad()  # Initialize gradients outside the inner loop
 
             for i, batch in enumerate(train_loader):
                 inputs, answers = batch
@@ -187,8 +187,8 @@ def train_model(train_loader, val_loader, model, processor, config):
                         {
                             "train/loss": loss.item() * config["gradient_accumulation_steps"],
                             "train/grad_norm": grad_norm.item(),
-                            "lr": optimizer.param_groups[0]["lr"],
-                            "epoch": current_step / (total_training_steps / config["epochs"])
+                            "train/lr": optimizer.param_groups[0]["lr"],
+                            "train/epoch": current_step / (total_training_steps / config["epochs"])
                         }
                     )
                     progress_bar.set_postfix(
