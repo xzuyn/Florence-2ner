@@ -18,7 +18,6 @@ from torch.optim.lr_scheduler import (
     SequentialLR,
 )
 from transformers import AutoModelForCausalLM, AutoProcessor
-from optimi import AdamW as OptimiAdamW
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -30,7 +29,8 @@ config = {
     "dataset_path": "",
     "wandb_project_name": "Florence-2-base",
     "run_name": "",
-    "epochs": 1,  # I found 3 or more to start overfitting. 1 or 2 is a good default.
+    "epochs": 1,  # I found 3 or more to start overfitting. 1 or 2 is a good default
+    "optimizer": "OptimiAdamW",  # Currently only supports "OptimiAdamW" & "CAME"
     "learning_rate": 1e-5,
     "gradient_checkpointing": True,  # May have no effect
     "freeze_vision": False,
@@ -40,7 +40,7 @@ config = {
     "eval_batch_size": 8,
     "gradient_accumulation_steps": 32,
     "clip_grad_norm": 1,
-    "weight_decay": 1e-5,  # 1e-5 default. Not sure if it should be higher or lower.
+    "weight_decay": 1e-5,  # 1e-5 default for OptimiAdamW, 1e-2 default for CAME
     "save_total_limit": 3,
     "save_steps": 50,
     "eval_steps": 50,
@@ -93,47 +93,98 @@ def collate_fn(batch, processor):
     return inputs, list(answers)
 
 
-def train_model(train_loader, val_loader, model, processor, config):
-    # TODO: Add support for choosing other optimizers such as CAME and PagedAdEMAMix8bit
-    optimizer = OptimiAdamW(
-        model.parameters(),
-        lr=config["learning_rate"],
-        weight_decay=config["weight_decay"],
-        decouple_lr=True
+# TODO: Add more optimizers
+def verify_optimizer_choice(optimizer_choice):
+    global OptimiAdamW, CAME
+
+    if optimizer_choice == "OptimiAdamW":
+        try:
+            from optimi import AdamW as OptimiAdamW
+        except ImportError:
+            raise ImportError("You do not have optimī installed. Please install it using `pip install torch-optimi`")
+    elif optimizer_choice == "CAME":
+        try:
+            from came_pytorch import CAME
+        except ImportError:
+            raise ImportError("You do not have CAME installed. Please install it using `pip install came-pytorch`")
+    else:
+        print("No valid optimizer selected. Falling back to OptimiAdamW.")
+        try:
+            from optimi import AdamW as OptimiAdamW
+        except ImportError:
+            raise ImportError("You do not have optimī installed. Please install it using `pip install torch-optimi`")
+
+
+# TODO: Add more optimizers
+# https://github.com/warner-benjamin/optimi
+# https://github.com/yangluo7/CAME
+def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_weight_decay):
+    if optimizer_name == "OptimiAdamW":
+        optimizer = OptimiAdamW(
+            model_parameters,
+            lr=optimizer_lr,
+            weight_decay=optimizer_weight_decay,
+            decouple_lr=True
+        )
+    elif optimizer_name == "CAME":
+        optimizer = CAME(
+            model_parameters,
+            lr=optimizer_lr,
+            weight_decay=optimizer_weight_decay
+        )
+    else:
+        optimizer = OptimiAdamW(
+            model_parameters,
+            lr=optimizer_lr,
+            weight_decay=optimizer_weight_decay,
+            decouple_lr=True
+        )
+
+    return optimizer
+
+
+# TODO: Add more LR schedulers
+def prepare_lr_scheduler(scheduler_optimizer, scheduler_warmup_steps, scheduler_total_training_steps):
+    warmup_scheduler = LinearLR(
+        scheduler_optimizer,
+        start_factor=1e-10,
+        end_factor=1.0,
+        total_iters=scheduler_warmup_steps
     )
+    cosine_scheduler = CosineAnnealingWarmRestarts(
+        scheduler_optimizer,
+        T_0=(scheduler_total_training_steps - scheduler_warmup_steps) + 2,  # Add 2 to prevent it from spiking on the last step
+    )
+
+    if scheduler_warmup_steps > 0:
+        scheduler = SequentialLR(
+            scheduler_optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[scheduler_warmup_steps]
+        )
+    else:
+        scheduler = cosine_scheduler
+
+    return scheduler
+
+
+def train_model(train_loader, val_loader, model, processor, config):
     tokenizer = processor.tokenizer
+    optimizer = prepare_optimizer(
+        model.parameters(),
+        config["optimizer"],
+        config["learning_rate"],
+        config["weight_decay"]
+    )
 
     # Calculate total training steps
     total_training_steps = (len(train_loader) // config["gradient_accumulation_steps"]) * config["epochs"]
     if len(train_loader) % config["gradient_accumulation_steps"] != 0:
         total_training_steps += 1
 
-    # Linear Warmup Scheduler
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=1e-10,
-        end_factor=1.0,
-        total_iters=config["warmup_steps"]
-    )
-
-    # Cosine Annealing Warm Restarts Scheduler
-    cosine_scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=(total_training_steps - config["warmup_steps"]) + 1,  # Add 1 to prevent it from spiking on the last step
-    )
-
-    # Combine schedulers using SequentialLR
-    if config["warmup_steps"] > 0:
-        scheduler = SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[config["warmup_steps"]]
-        )
-    else:
-        scheduler = cosine_scheduler
+    scheduler = prepare_lr_scheduler(optimizer, config["warmup_steps"], total_training_steps)
 
     current_step = 0
-
     with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
         evaluate_model(val_loader, model, processor, run, current_step)  # Evaluate at the beginning
 
@@ -275,9 +326,9 @@ def evaluate_model(val_loader, model, processor, run, current_step):
                 # Log to wandb table
                 table.add_data(answer, parsed_answer["<CAPTION>"].replace("<pad>", ""))
                 print("\n----")
-                print("  GT:", answer)
+                print("Ground Truth:", answer)
                 print("")
-                print("Pred:", parsed_answer["<CAPTION>"].replace("<pad>", ""))
+                print("  Prediction:", parsed_answer["<CAPTION>"].replace("<pad>", ""))
                 print("----")
 
             break  # Only compare the first batch
@@ -323,6 +374,8 @@ def filter_data_chunk(chunk, processor):
             print(f"Error processing {txt_path}: {e}")
     return filtered_chunk
 
+
+verify_optimizer_choice(config["optimizer"])
 
 # Initialize components
 model = AutoModelForCausalLM.from_pretrained(
