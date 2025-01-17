@@ -27,6 +27,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 config = {
     "model_name": "microsoft/Florence-2-base",
     "dataset_path": "",
+    "wandb_project_name": "Florence-2-base",
     "run_name": "",
     "epochs": 1,  # I found 3 or more to start overfitting. 1 or 2 is a good default.
     "learning_rate": 1e-5,
@@ -35,7 +36,7 @@ config = {
     "freeze_language": False,
     "freeze_other": False,
     "train_batch_size": 8,
-    "eval_batch_size": 16,
+    "eval_batch_size": 8,
     "gradient_accumulation_steps": 32,
     "clip_grad_norm": 1,
     "weight_decay": 1e-5,  # 1e-5 default. Not sure if it should be higher or lower.
@@ -132,7 +133,7 @@ def train_model(train_loader, val_loader, model, processor, config):
 
     current_step = 0
 
-    with wandb.init(project="Florence-2", name=config["run_name"]) as run:
+    with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
         evaluate_model(val_loader, model, processor, run, current_step)  # Evaluate at the beginning
 
         for epoch in range(config["epochs"]):
@@ -172,6 +173,7 @@ def train_model(train_loader, val_loader, model, processor, config):
                 if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
                     torch.cuda.empty_cache()
                     gc.collect()
+
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
                     optimizer.step()
                     scheduler.step()
@@ -184,7 +186,8 @@ def train_model(train_loader, val_loader, model, processor, config):
                         {
                             "train/loss": loss.item() * config["gradient_accumulation_steps"],
                             "train/grad_norm": grad_norm.item(),
-                            "lr": optimizer.param_groups[0]["lr"]
+                            "lr": optimizer.param_groups[0]["lr"],
+                            "epoch": current_step / (total_training_steps / config["epochs"])
                         }
                     )
                     progress_bar.set_postfix(
