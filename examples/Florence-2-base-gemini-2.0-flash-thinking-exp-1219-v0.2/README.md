@@ -15,7 +15,7 @@ base_model:
 pipeline_tag: image-to-text
 library_name: transformers
 ---
-# Florence-2-base-gemini-2.0-flash-thinking-exp-1219-v0.2
+# [Florence-2-base-gemini-2.0-flash-thinking-exp-1219-v0.2](https://huggingface.co/PJMixers-Images/Florence-2-base-gemini-2.0-flash-thinking-exp-1219-v0.2)
 
 A [microsoft/Florence-2-base](https://huggingface.co/microsoft/Florence-2-base) finetune intended to improve the quality and formatting of image captioning.
 
