@@ -21,6 +21,8 @@ A [microsoft/Florence-2-base](https://huggingface.co/microsoft/Florence-2-base) 
 
 This is a very early version as I have a limited number of training images and the variety of images is lacking. Basically all images used were *high quality* so captioning *low quality* images may perform poorly.
 
+Uses `<CAPTION>` task prompt. Training on `<DETAILED_CAPTION>` or `<MORE_DETAILED_CAPTION>` did not seem to make a difference in quality compared to `<CAPTION>`.
+
 ## Model Evaluation
 
 | Source Image | Ground Truth | Original Model Prediction | Fine-tuned Model Prediction |
@@ -75,4 +77,3 @@ Trained with [Florence-2ner](https://github.com/xzuyn/Florence-2ner) using this 
     "attn_implementation": "sdpa"
 }
 ```
-
