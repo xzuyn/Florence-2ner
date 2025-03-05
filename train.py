@@ -22,7 +22,9 @@ from torch.optim.lr_scheduler import (
 from transformers import AutoModelForCausalLM, AutoProcessor
 
 
+Image.MAX_IMAGE_PIXELS = None
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 # Configuration parameters
 config = {
@@ -70,7 +72,7 @@ class LocalImageTextDataset(Dataset):
             if image.mode != "RGB":
                 image = image.convert("RGB")
             with open(prompt_path, "r") as f:
-                answer = f.read().strip()
+                answer = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
             return self.task_prompt, answer, image
         except Exception as e:
             raise RuntimeError(f"Error loading data from {image_path}: {e}")
@@ -509,13 +511,30 @@ def filter_data_chunk(chunk, processor):
     for img_path, txt_path in chunk:
         try:
             with open(txt_path, "r") as f:
-                text = f.read().strip()
+                text = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
             inputs = tokenizer(text, return_tensors="pt")
             if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
                 filtered_chunk.append((img_path, txt_path))
+            else:
+                print(f"Caption too long: {img_path}")
         except Exception as e:
             print(f"Error processing {txt_path}: {e}")
     return filtered_chunk
+
+
+def get_all_files(dataset_path):
+    """Recursively gathers all image and text file pairs from a directory and its subdirectories."""
+    all_files = []
+    for root, _, files in os.walk(dataset_path):
+        for file in files:
+            if file.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                img_file = Path(root) / file
+                txt_file = img_file.with_suffix(".txt")
+                if txt_file.exists():
+                    all_files.append((img_file, txt_file))
+                else:
+                    print(f"No caption for: \"{img_file}\"")
+    return all_files
 
 
 verify_optimizer_choice(config["optimizer"])
@@ -529,17 +548,16 @@ model = AutoModelForCausalLM.from_pretrained(
 ).to(device)
 processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
 
+# TODO: Move all this to a function (enable_optimizations())
+# TODO: Verify if this works, and if unsloth/OneTrainer CPU offloaded checkpointing can be added
 if config["gradient_checkpointing"]:
     model.gradient_checkpointing_enable()
-
 if config["freeze_language"]:
     for param in model.language_model.parameters():
         param.requires_grad = False
-
 if config["freeze_vision"]:
     for param in model.vision_tower.parameters():
         param.requires_grad = False
-
 if config["freeze_other"]:
     image_pos_embed.column_embeddings.weight.requires_grad = False
     image_pos_embed.row_embeddings.weight.requires_grad = False
@@ -554,10 +572,11 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(config["seed"])
 
 dataset_path = Path(config["dataset_path"])
-all_files = [
-    (img_file, img_file.with_suffix(".txt")) for img_file in dataset_path.iterdir()
-    if img_file.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and img_file.with_suffix(".txt").exists()
-]
+# all_files = [
+#     (img_file, img_file.with_suffix(".txt")) for img_file in dataset_path.iterdir()
+#     if img_file.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and img_file.with_suffix(".txt").exists()
+# ]
+all_files = get_all_files(dataset_path)
 
 gc.collect()
 
@@ -578,9 +597,10 @@ all_files = filtered_files
 random.shuffle(all_files)
 eval_size = int(len(all_files) * config["eval_split_ratio"])
 eval_dataset_pairs = all_files[:eval_size]
-train_dataset_pairs = all_files[eval_size:]
+train_dataset_pairs = all_files[eval_size:]  # TODO: Try combining multiple epochs into a single shuffled epoch (making sure to pull the eval split out beforehand)
 
 train_dataset = LocalImageTextDataset(train_dataset_pairs)
+# TODO: Add ability to specify a val set
 val_dataset = LocalImageTextDataset(eval_dataset_pairs)
 
 train_loader = DataLoader(
