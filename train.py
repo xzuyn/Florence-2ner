@@ -34,10 +34,10 @@ config = {
     "dataset_path": "",
     "wandb_project_name": "Florence-2-base",
     "run_name": "",
-    "epochs": 1,  # I found 3 or more to start overfitting. 1 or 2 is a good default
+    "epochs": 2,  # I found 3 or more to start overfitting. 1 or 2 is a good default
     "optimizer": "CAME",  # Currently supports "OptimiAdamW" & "CAME"
     "learning_rate": 1e-6,
-    "min_learning_rate": 0,  # Currently only works with REX
+    "min_learning_rate": 1e-7,  # Currently only works with REX
     "lr_scheduler": "REX",  # Currently supports "Constant", "Cosine", and "REX"
     "gradient_checkpointing": True,  # May have no effect
     "freeze_vision": False,
@@ -45,12 +45,12 @@ config = {
     "freeze_other": False,
     "train_batch_size": 8,
     "eval_batch_size": 8,
-    "gradient_accumulation_steps": 32,
+    "gradient_accumulation_steps": 8,
     "clip_grad_norm": 1,
-    "weight_decay": 1e-2,  # 1e-5 default for OptimiAdamW, 1e-2 default for CAME
+    "weight_decay": 0.01,  # 1e-5 default for OptimiAdamW, 1e-2 default for CAME
     "save_total_limit": 3,
-    "save_steps": 50,
-    "eval_steps": 50,
+    "save_steps": 10,
+    "eval_steps": 10,
     "warmup_steps": 50,
     "eval_split": 0.1,
     "seed": 42,
