@@ -5,6 +5,7 @@ import random
 import multiprocessing
 from pathlib import Path
 import shutil
+import re
 
 from PIL import Image
 from tqdm import tqdm
@@ -112,7 +113,7 @@ class RexLR(LRScheduler):
         self.max_lr = max_lr
         self.total_steps = total_steps
         self.num_warmup_steps = num_warmup_steps
-        self.last_step = last_step - 1
+        self.last_step = max(last_step - 1, 0)
 
         # Ensure each parameter group has an "initial_lr" key to avoid issues when resuming.
         for group in optimizer.param_groups:
@@ -164,7 +165,8 @@ def collate_fn(batch, processor):
             text=list(questions),
             images=validated_images,
             return_tensors="pt",
-            padding=True,
+            padding=False,
+            truncation=False,
         ).to(device, torch.bfloat16)
     except ValueError as e:
         print(f"Processor error: {e}")
@@ -215,14 +217,14 @@ def prepare_optimizer(
         optimizer = CAME(
             model_parameters,
             lr=optimizer_lr,
-            weight_decay=optimizer_weight_decay
+            weight_decay=optimizer_weight_decay,
         )
     else:
         optimizer = OptimiAdamW(
             model_parameters,
             lr=optimizer_lr,
             weight_decay=optimizer_weight_decay,
-            decouple_lr=True
+            decouple_lr=True,
         )
 
     return optimizer
@@ -328,24 +330,27 @@ def train_model(
                 labels = tokenizer(
                     text=answers,
                     return_tensors="pt",
-                    padding=True,
+                    padding="longest",
+                    truncation=False,
                     return_token_type_ids=False,
                 ).input_ids.to(device)
 
                 # Create attention mask to ignore padding tokens
                 attention_mask = labels != tokenizer.pad_token_id
 
-                outputs = model(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    labels=labels,
-                    attention_mask=attention_mask
-                )
-                loss = outputs.loss
-                loss = loss / config["gradient_accumulation_steps"]
+                with torch.amp.autocast("cuda"):
+                    outputs = model(
+                        input_ids=inputs["input_ids"],
+                        pixel_values=inputs["pixel_values"],
+                        labels=labels,
+                        attention_mask=attention_mask
+                    )
+                    loss = outputs.loss
+                    loss = loss / config["gradient_accumulation_steps"]
                 loss.backward()
 
                 if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                     gc.collect()
 
@@ -357,9 +362,10 @@ def train_model(
                     current_step += 1
                     progress_bar.update(1)
 
+                    scalar_loss = loss.detach().item() * config["gradient_accumulation_steps"]
                     run.log(
                         {
-                            "train/loss": loss.item() * config["gradient_accumulation_steps"],
+                            "train/loss": scalar_loss,
                             "train/grad_norm": grad_norm.item(),
                             "train/lr": optimizer.param_groups[0]["lr"],
                             "train/epoch": current_step / (total_training_steps / config["epochs"])
@@ -367,7 +373,7 @@ def train_model(
                     )
                     progress_bar.set_postfix(
                         {
-                            "loss": loss.item() * config["gradient_accumulation_steps"],
+                            "loss": scalar_loss,
                             "grad_norm": grad_norm.item()
                         }
                     )
@@ -418,25 +424,28 @@ def evaluate_model(
     table = wandb.Table(columns=["Ground Truth", "Prediction"])
     with torch.no_grad():
         for batch in tqdm(val_loader, desc="Validation"):
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
             gc.collect()
             inputs, answers = batch
             labels = tokenizer(
                 text=answers,
                 return_tensors="pt",
-                padding=True,
+                padding="longest",
+                truncation=False,
             ).input_ids.to(device)
 
             # Create attention mask for padding tokens
             attention_mask = labels != tokenizer.pad_token_id
 
-            outputs = model(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                labels=labels,
-                attention_mask=attention_mask
-            )
-            total_loss += outputs.loss.item()
+            with torch.amp.autocast("cuda"):
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    labels=labels,
+                    attention_mask=attention_mask
+                )
+                total_loss += outputs.loss.item()
             steps += 1
 
         for batch in val_loader:
@@ -456,18 +465,18 @@ def evaluate_model(
             for generated_text, answer in zip(generated_texts, answers):
                 parsed_answer = processor.post_process_generation(
                     generated_text,
-                    task="<CAPTION>",
+                    task=config["task_prompt"],
                     image_size=(
                         inputs["pixel_values"].shape[-2],
                         inputs["pixel_values"].shape[-1],
                     ),
                 )
                 # Log to wandb table
-                table.add_data(answer, parsed_answer["<CAPTION>"].replace("<pad>", ""))
+                table.add_data(answer, parsed_answer[config["task_prompt"]].replace("<pad>", ""))
                 print("\n----")
                 print("Ground Truth:", answer)
                 print("")
-                print("  Prediction:", parsed_answer["<CAPTION>"].replace("<pad>", ""))
+                print("  Prediction:", parsed_answer[config["task_prompt"]].replace("<pad>", ""))
                 print("----")
 
             break  # Only compare the first batch
@@ -511,7 +520,7 @@ def filter_data_chunk(chunk, processor):
     for img_path, txt_path in chunk:
         try:
             with open(txt_path, "r") as f:
-                text = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
+                text = f.read().replace("  ", " ").strip()
             inputs = tokenizer(text, return_tensors="pt")
             if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
                 filtered_chunk.append((img_path, txt_path))
@@ -559,12 +568,12 @@ if config["freeze_vision"]:
     for param in model.vision_tower.parameters():
         param.requires_grad = False
 if config["freeze_other"]:
-    image_pos_embed.column_embeddings.weight.requires_grad = False
-    image_pos_embed.row_embeddings.weight.requires_grad = False
-    visual_temporal_embed.pos_idx_to_embed.requires_grad = False
-    image_proj_norm.bias.requires_grad = False
-    image_proj_norm.weight.requires_grad = False
-    image_projection.requires_grad = False
+    model.image_pos_embed.column_embeddings.weight.requires_grad = False
+    model.image_pos_embed.row_embeddings.weight.requires_grad = False
+    model.visual_temporal_embed.pos_idx_to_embed.requires_grad = False
+    model.image_proj_norm.bias.requires_grad = False
+    model.image_proj_norm.weight.requires_grad = False
+    model.image_projection.requires_grad = False
 
 random.seed(config["seed"])
 torch.manual_seed(config["seed"])
@@ -595,7 +604,7 @@ print(f"Filtered out {len(all_files) - len(filtered_files)} files due to token l
 all_files = filtered_files
 
 random.shuffle(all_files)
-eval_size = int(len(all_files) * config["eval_split_ratio"])
+eval_size = int(len(all_files) * config["eval_split"]) if config["eval_split"] < 1 else min(int(config["eval_split"]), len(all_files))
 eval_dataset_pairs = all_files[:eval_size]
 train_dataset_pairs = all_files[eval_size:]  # TODO: Try combining multiple epochs into a single shuffled epoch (making sure to pull the eval split out beforehand)
 
@@ -615,6 +624,7 @@ val_loader = DataLoader(
     collate_fn=lambda batch: collate_fn(batch, processor)
 )
 
+torch.cuda.synchronize()
 torch.cuda.empty_cache()
 gc.collect()
 
