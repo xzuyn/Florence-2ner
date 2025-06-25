@@ -63,6 +63,7 @@ config = {
     }
 }
 
+
 # https://github.com/IvanVassi/REX_LR
 class RexLR(LRScheduler):
     """
@@ -97,7 +98,7 @@ class RexLR(LRScheduler):
         self.max_lr = max_lr
         self.total_steps = total_steps
         self.num_warmup_steps = num_warmup_steps
-        self.last_step = last_step - 1
+        self.last_step = max(last_step - 1, 0)
 
         # Ensure each parameter group has an "initial_lr" key to avoid issues when resuming.
         for group in optimizer.param_groups:
@@ -275,7 +276,7 @@ def prepare_lr_scheduler(
             optimizer=scheduler_optimizer,
             max_lr=scheduler_lr,
             min_lr=scheduler_min_lr,
-            total_steps=scheduler_total_training_steps - scheduler_warmup_steps,
+            total_steps=scheduler_total_training_steps,  # - scheduler_warmup_steps,
             num_warmup_steps=scheduler_warmup_steps
         )
     else:
@@ -338,7 +339,7 @@ def train_model(
 
         for epoch in range(config["epochs"]):
             model.train()
-            progress_bar = tqdm(range(total_training_steps), desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]")
+            progress_bar = tqdm(range(int(total_training_steps / config["epochs"])), desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]")
             optimizer.zero_grad()  # Initialize gradients outside the inner loop
 
             for i, batch in enumerate(train_loader):
