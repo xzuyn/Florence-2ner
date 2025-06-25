@@ -51,7 +51,7 @@ config = {
     "save_steps": 50,
     "eval_steps": 50,
     "warmup_steps": 50,
-    "eval_split_ratio": 0.1,
+    "eval_split": 0.1,
     "seed": 42,
     "filtering_processes": 128,
     "attn_implementation": "sdpa"
@@ -520,7 +520,7 @@ def filter_data_chunk(chunk, processor):
     for img_path, txt_path in chunk:
         try:
             with open(txt_path, "r") as f:
-                text = f.read().replace("  ", " ").strip()
+                text = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
             inputs = tokenizer(text, return_tensors="pt")
             if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
                 filtered_chunk.append((img_path, txt_path))
