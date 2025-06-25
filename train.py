@@ -187,7 +187,7 @@ def collate_fn(batch, processor):
             text=list(tasks),
             images=validated_images,
             return_tensors="pt",
-            padding=False,
+            padding="longest",
             truncation=False,
         ).to(device, torch.bfloat16)
     except ValueError as e:
