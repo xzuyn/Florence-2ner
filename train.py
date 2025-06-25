@@ -37,6 +37,7 @@ config = {
     "epochs": 1,  # I found 3 or more to start overfitting. 1 or 2 is a good default
     "optimizer": "CAME",  # Currently supports "OptimiAdamW" & "CAME"
     "learning_rate": 1e-6,
+    "min_learning_rate": 0,  # Currently only works with REX
     "lr_scheduler": "REX",  # Currently supports "Constant", "Cosine", and "REX"
     "gradient_checkpointing": True,  # May have no effect
     "freeze_vision": False,
@@ -236,6 +237,7 @@ def prepare_lr_scheduler(
     scheduler_optimizer,
     scheduler_name,
     scheduler_lr,
+    scheduler_min_lr,
     scheduler_warmup_steps,
     scheduler_total_training_steps
 ):
@@ -252,7 +254,7 @@ def prepare_lr_scheduler(
         main_scheduler = RexLR(
             optimizer=scheduler_optimizer,
             max_lr=scheduler_lr,
-            min_lr=0,
+            min_lr=scheduler_min_lr,
             total_steps=scheduler_total_training_steps - scheduler_warmup_steps,
             num_warmup_steps=scheduler_warmup_steps
         )
@@ -305,6 +307,7 @@ def train_model(
         optimizer,
         config["lr_scheduler"],
         config["learning_rate"],
+        config["min_learning_rate"],
         config["warmup_steps"],
         total_training_steps
     )
