@@ -6,10 +6,9 @@ import multiprocessing
 from pathlib import Path
 import shutil
 import re
-
+import math
 from PIL import Image
 from tqdm import tqdm
-
 import wandb
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -22,7 +21,7 @@ from torch.optim.lr_scheduler import (
 )
 from transformers import AutoModelForCausalLM, AutoProcessor
 
-
+# Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -30,8 +29,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Configuration parameters
 config = {
     "model_name": "microsoft/Florence-2-base",
-    "task_prompt": "<CAPTION>",
-    "dataset_path": "",
     "wandb_project_name": "Florence-2-base",
     "run_name": "",
     "epochs": 2,  # I found 3 or more to start overfitting. 1 or 2 is a good default
@@ -56,29 +53,15 @@ config = {
     "seed": 42,
     "filtering_processes": 128,
     "attn_implementation": "sdpa"
+    "dataset_config": {
+        "<CAPTION>": [
+            "...",
+        ],
+        # "<DETAILED_CAPTION>": [
+        #     "...",
+        # ]
+    }
 }
-
-
-class LocalImageTextDataset(Dataset):
-    def __init__(self, data_pairs, task_prompt=config["task_prompt"]):
-        self.data_pairs = data_pairs
-        self.task_prompt = task_prompt
-
-    def __len__(self):
-        return len(self.data_pairs)
-
-    def __getitem__(self, idx):
-        image_path, prompt_path = self.data_pairs[idx]
-        try:
-            image = Image.open(image_path)
-            if image.mode != "RGB":
-                image = image.convert("RGB")
-            with open(prompt_path, "r") as f:
-                answer = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
-            return self.task_prompt, answer, image
-        except Exception as e:
-            raise RuntimeError(f"Error loading data from {image_path}: {e}")
-
 
 # https://github.com/IvanVassi/REX_LR
 class RexLR(LRScheduler):
@@ -155,15 +138,52 @@ class RexLR(LRScheduler):
         return [base_lr * rex_factor for base_lr in self.base_lrs]
 
 
+class LocalImageTextDataset(Dataset):
+    def __init__(self, data_pairs):
+        # data_pairs: list of tuples (task_prompt, image_path, text_path)
+        self.data_pairs = data_pairs
+
+    def __len__(self):
+        return len(self.data_pairs)
+
+    def __getitem__(self, idx):
+        task_prompt, image_path, prompt_path = self.data_pairs[idx]
+        try:
+            image = Image.open(image_path)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            with open(prompt_path, "r") as f:
+                answer = f.read().replace("  ", " ").strip()
+            return task_prompt, answer, image
+        except Exception as e:
+            raise RuntimeError(f"Error loading data from {image_path}: {e}")
+
+
+def get_all_files_by_prompt(dataset_config):
+    """Gather all (prompt, image, text) tuples from multiple directories per task."""
+    all_pairs = []
+    for task_prompt, dirs in dataset_config.items():
+        for d in dirs:
+            for root, _, files in os.walk(d):
+                for file in files:
+                    if file.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+                        img_file = Path(root) / file
+                        txt_file = img_file.with_suffix(".txt")
+                        if txt_file.exists():
+                            all_pairs.append((task_prompt, img_file, txt_file))
+    return all_pairs
+
+
 def collate_fn(batch, processor):
-    questions, answers, images = zip(*batch)
+    # Unpack triples
+    tasks, answers, images = zip(*batch)
 
     # Convert all images to RGB if needed
     validated_images = [img.convert("RGB") if img.mode != "RGB" else img for img in images]
 
     try:
         inputs = processor(
-            text=list(questions),
+            text=list(tasks),
             images=validated_images,
             return_tensors="pt",
             padding=False,
@@ -173,7 +193,7 @@ def collate_fn(batch, processor):
         print(f"Processor error: {e}")
         raise
 
-    return inputs, list(answers)
+    return list(tasks), inputs, list(answers)
 
 
 # TODO: Add more optimizers
@@ -299,7 +319,7 @@ def train_model(
     )
 
     # Calculate total training steps
-    total_training_steps = (len(train_loader) // config["gradient_accumulation_steps"]) * config["epochs"]
+    total_training_steps = math.ceil(len(train_loader) / config["gradient_accumulation_steps"]) * config["epochs"]
     if len(train_loader) % config["gradient_accumulation_steps"] != 0:
         total_training_steps += 1
 
@@ -318,18 +338,11 @@ def train_model(
 
         for epoch in range(config["epochs"]):
             model.train()
-            progress_bar = tqdm(
-                range(
-                    len(train_loader) // config["gradient_accumulation_steps"]
-                    if len(train_loader) % config["gradient_accumulation_steps"] == 0
-                    else len(train_loader) // config["gradient_accumulation_steps"] + 1
-                ),
-                desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]"
-            )
+            progress_bar = tqdm(range(total_training_steps), desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]")
             optimizer.zero_grad()  # Initialize gradients outside the inner loop
 
             for i, batch in enumerate(train_loader):
-                inputs, answers = batch
+                _, inputs, answers = batch
                 labels = tokenizer(
                     text=answers,
                     return_tensors="pt",
@@ -421,17 +434,18 @@ def evaluate_model(
     current_step
 ):
     model.eval()
-    tokenizer = processor.tokenizer
     total_loss = 0
     steps = 0
     table = wandb.Table(columns=["Ground Truth", "Prediction"])
+
+    # Loss computation
     with torch.no_grad():
-        for batch in tqdm(val_loader, desc="Validation"):
+        for tasks, inputs, answers in tqdm(val_loader, desc="Validation"):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             gc.collect()
-            inputs, answers = batch
-            labels = tokenizer(
+
+            labels = processor.tokenizer(
                 text=answers,
                 return_tensors="pt",
                 padding="longest",
@@ -439,7 +453,7 @@ def evaluate_model(
             ).input_ids.to(device)
 
             # Create attention mask for padding tokens
-            attention_mask = labels != tokenizer.pad_token_id
+            attention_mask = labels != processor.tokenizer.pad_token_id
 
             with torch.amp.autocast("cuda"):
                 outputs = model(
@@ -451,8 +465,9 @@ def evaluate_model(
                 total_loss += outputs.loss.item()
             steps += 1
 
-        for batch in val_loader:
-            inputs, answers = batch
+    # Sample predictions (first batch only)
+    with torch.no_grad():
+        for tasks, inputs, answers in val_loader:
             generated_ids = model.generate(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
@@ -465,27 +480,28 @@ def evaluate_model(
                 skip_special_tokens=False
             )
 
-            for generated_text, answer in zip(generated_texts, answers):
-                parsed_answer = processor.post_process_generation(
-                    generated_text,
-                    task=config["task_prompt"],
+            for prompt, gen_text, answer in zip(tasks, generated_texts, answers):
+                parsed = processor.post_process_generation(
+                    gen_text,
+                    task=prompt,
                     image_size=(
                         inputs["pixel_values"].shape[-2],
                         inputs["pixel_values"].shape[-1],
                     ),
                 )
-                # Log to wandb table
-                table.add_data(answer, parsed_answer[config["task_prompt"]].replace("<pad>", ""))
-                print("\n----")
-                print("Ground Truth:", answer)
-                print("")
-                print("  Prediction:", parsed_answer[config["task_prompt"]].replace("<pad>", ""))
-                print("----")
-
-            break  # Only compare the first batch
+                # Log to wandb
+                table.add_data(answer, parsed[prompt].replace("<pad>", ""))
+                print(f"\n----\n      Prompt: {prompt}\nGround Truth: {answer}\n  Prediction: {parsed[prompt].replace('<pad>', '')}\n----")
+            break
 
     avg_loss = total_loss / steps
-    run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
+    run.log(
+        {
+            "validation/avg_loss": avg_loss,
+            "validation/predictions": table
+        },
+        step=current_step
+    )
 
 
 def save_model_checkpoint(
@@ -518,40 +534,24 @@ def save_model_checkpoint(
 
 
 def filter_data_chunk(chunk, processor):
+    """Filter a chunk of (task_prompt, image_path, text_path) tuples by token-length."""
     filtered_chunk = []
     tokenizer = processor.tokenizer
-    for img_path, txt_path in chunk:
+    for task_prompt, img_path, txt_path in chunk:
         try:
             with open(txt_path, "r") as f:
-                text = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
+                text = f.read().replace("  ", " ").strip()
             inputs = tokenizer(text, return_tensors="pt")
             if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
-                filtered_chunk.append((img_path, txt_path))
+                filtered_chunk.append((task_prompt, img_path, txt_path))
             else:
                 print(f"Caption too long: {img_path}")
         except Exception as e:
             print(f"Error processing {txt_path}: {e}")
     return filtered_chunk
 
-
-def get_all_files(dataset_path):
-    """Recursively gathers all image and text file pairs from a directory and its subdirectories."""
-    all_files = []
-    for root, _, files in os.walk(dataset_path):
-        for file in files:
-            if file.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-                img_file = Path(root) / file
-                txt_file = img_file.with_suffix(".txt")
-                if txt_file.exists():
-                    all_files.append((img_file, txt_file))
-                else:
-                    print(f"No caption for: \"{img_file}\"")
-    return all_files
-
-
-verify_optimizer_choice(config["optimizer"])
-
 # Initialize components
+verify_optimizer_choice(config["optimizer"])
 model = AutoModelForCausalLM.from_pretrained(
     config["model_name"],
     torch_dtype=torch.bfloat16,
@@ -583,33 +583,28 @@ torch.manual_seed(config["seed"])
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(config["seed"])
 
-dataset_path = Path(config["dataset_path"])
-# all_files = [
-#     (img_file, img_file.with_suffix(".txt")) for img_file in dataset_path.iterdir()
-#     if img_file.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and img_file.with_suffix(".txt").exists()
-# ]
-all_files = get_all_files(dataset_path)
+# Gather and filter data
+print("Gathering files from multiple datasets...")
+all_pairs = get_all_files_by_prompt(config["dataset_config"])
 
 gc.collect()
 
 # Optimized filtering using multiprocessing
 print("Filtering data based on token length using multiprocessing...")
 with multiprocessing.Pool(processes=config["filtering_processes"]) as pool:
-    chunk_size = max(1, len(all_files) // config["filtering_processes"])
-    chunks = [all_files[i:i + chunk_size] for i in range(0, len(all_files), chunk_size)]
-    results = list(tqdm(pool.starmap(filter_data_chunk, [(chunk, processor) for chunk in chunks]), total=len(chunks)))
+    chunk_size = max(1, len(all_pairs) // config["filtering_processes"])
+    chunks = [all_pairs[i:i + chunk_size] for i in range(0, len(all_pairs), chunk_size)]
+    results = list(tqdm(
+        pool.starmap(filter_data_chunk, [(chunk, processor) for chunk in chunks]),
+        total=len(chunks)
+    ))
+filtered_pairs = [item for sublist in results for item in sublist]
+print(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
 
-gc.collect()
-
-filtered_files = [item for sublist in results for item in sublist]
-
-print(f"Filtered out {len(all_files) - len(filtered_files)} files due to token length.")
-all_files = filtered_files
-
-random.shuffle(all_files)
-eval_size = int(len(all_files) * config["eval_split"]) if config["eval_split"] < 1 else min(int(config["eval_split"]), len(all_files))
-eval_dataset_pairs = all_files[:eval_size]
-train_dataset_pairs = all_files[eval_size:]  # TODO: Try combining multiple epochs into a single shuffled epoch (making sure to pull the eval split out beforehand)
+random.shuffle(filtered_pairs)
+eval_size = int(len(filtered_pairs) * config["eval_split"]) if config["eval_split"] < 1 else min(int(config["eval_split"]), len(filtered_pairs))
+eval_dataset_pairs = filtered_pairs[:eval_size]
+train_dataset_pairs = filtered_pairs[eval_size:]
 
 train_dataset = LocalImageTextDataset(train_dataset_pairs)
 # TODO: Add ability to specify a val set
