@@ -154,7 +154,7 @@ class LocalImageTextDataset(Dataset):
             if image.mode != "RGB":
                 image = image.convert("RGB")
             with open(prompt_path, "r") as f:
-                answer = f.read().replace("  ", " ").strip()
+                answer = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
             return task_prompt, answer, image
         except Exception as e:
             raise RuntimeError(f"Error loading data from {image_path}: {e}")
@@ -541,7 +541,7 @@ def filter_data_chunk(chunk, processor):
     for task_prompt, img_path, txt_path in chunk:
         try:
             with open(txt_path, "r") as f:
-                text = f.read().replace("  ", " ").strip()
+                text = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
             inputs = tokenizer(text, return_tensors="pt")
             if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
                 filtered_chunk.append((task_prompt, img_path, txt_path))
