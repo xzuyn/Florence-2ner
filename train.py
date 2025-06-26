@@ -21,6 +21,7 @@ from torch.optim.lr_scheduler import (
 )
 from transformers import AutoModelForCausalLM, AutoProcessor
 
+
 # Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,7 +53,7 @@ config = {
     "eval_split": 0.1,
     "seed": 42,
     "filtering_processes": 128,
-    "attn_implementation": "sdpa"
+    "attn_implementation": "sdpa",
     "dataset_config": {
         "<CAPTION>": [
             "...",
@@ -276,7 +277,7 @@ def prepare_lr_scheduler(
             optimizer=scheduler_optimizer,
             max_lr=scheduler_lr,
             min_lr=scheduler_min_lr,
-            total_steps=scheduler_total_training_steps,  # - scheduler_warmup_steps,
+            total_steps=scheduler_total_training_steps,
             num_warmup_steps=scheduler_warmup_steps
         )
     else:
@@ -355,15 +356,14 @@ def train_model(
                 # Create attention mask to ignore padding tokens
                 attention_mask = labels != tokenizer.pad_token_id
 
-                with torch.amp.autocast("cuda"):
-                    outputs = model(
-                        input_ids=inputs["input_ids"],
-                        pixel_values=inputs["pixel_values"],
-                        labels=labels,
-                        attention_mask=attention_mask
-                    )
-                    loss = outputs.loss
-                    loss = loss / config["gradient_accumulation_steps"]
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    labels=labels,
+                    attention_mask=attention_mask
+                )
+                loss = outputs.loss
+                loss = loss / config["gradient_accumulation_steps"]
                 loss.backward()
 
                 if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
@@ -456,14 +456,13 @@ def evaluate_model(
             # Create attention mask for padding tokens
             attention_mask = labels != processor.tokenizer.pad_token_id
 
-            with torch.amp.autocast("cuda"):
-                outputs = model(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    labels=labels,
-                    attention_mask=attention_mask
-                )
-                total_loss += outputs.loss.item()
+            outputs = model(
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                labels=labels,
+                attention_mask=attention_mask
+            )
+            total_loss += outputs.loss.item()
             steps += 1
 
         # Sample predictions (first batch only)
@@ -595,10 +594,12 @@ print("Filtering data based on token length using multiprocessing...")
 with multiprocessing.Pool(processes=config["filtering_processes"]) as pool:
     chunk_size = max(1, len(all_pairs) // config["filtering_processes"])
     chunks = [all_pairs[i:i + chunk_size] for i in range(0, len(all_pairs), chunk_size)]
-    results = list(tqdm(
-        pool.starmap(filter_data_chunk, [(chunk, processor) for chunk in chunks]),
-        total=len(chunks)
-    ))
+    results = list(
+        tqdm(
+            pool.starmap(filter_data_chunk, [(chunk, processor) for chunk in chunks]),
+            total=len(chunks)
+        )
+    )
 filtered_pairs = [item for sublist in results for item in sublist]
 print(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
 
