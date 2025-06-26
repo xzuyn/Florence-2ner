@@ -44,7 +44,7 @@ config = {
     "train_batch_size": 8,
     "eval_batch_size": 8,
     "gradient_accumulation_steps": 8,
-    "clip_grad_norm": 1,
+    "clip_grad_norm": 0.5,
     "weight_decay": 0.01,  # 1e-5 default for OptimiAdamW, 1e-2 default for CAME
     "save_total_limit": 3,
     "save_steps": 10,
