@@ -473,6 +473,7 @@ def evaluate_model(
                 pixel_values=inputs["pixel_values"],
                 max_new_tokens=1024,
                 num_beams=5,
+                min_p=0.05,
                 do_sample=True
             )
             generated_texts = processor.batch_decode(
