@@ -198,28 +198,6 @@ def collate_fn(batch, processor):
 
 
 # TODO: Add more optimizers
-def verify_optimizer_choice(optimizer_choice):
-    global OptimiAdamW, CAME
-
-    if optimizer_choice == "OptimiAdamW":
-        try:
-            from optimi import AdamW as OptimiAdamW
-        except ImportError:
-            raise ImportError("You do not have optimī installed. Please install it using `pip install torch-optimi`")
-    elif optimizer_choice == "CAME":
-        try:
-            from came_pytorch import CAME
-        except ImportError:
-            raise ImportError("You do not have CAME installed. Please install it using `pip install came-pytorch`")
-    else:
-        print("No valid optimizer selected. Falling back to OptimiAdamW.")
-        try:
-            from optimi import AdamW as OptimiAdamW
-        except ImportError:
-            raise ImportError("You do not have optimī installed. Please install it using `pip install torch-optimi`")
-
-
-# TODO: Add more optimizers
 # https://github.com/warner-benjamin/optimi
 # https://github.com/yangluo7/CAME
 def prepare_optimizer(
@@ -229,25 +207,36 @@ def prepare_optimizer(
     optimizer_weight_decay
 ):
     if optimizer_name == "OptimiAdamW":
-        optimizer = OptimiAdamW(
-            model_parameters,
-            lr=optimizer_lr,
-            weight_decay=optimizer_weight_decay,
-            decouple_lr=True
-        )
+        try:
+            from optimi import AdamW as OptimiAdamW
+            optimizer = OptimiAdamW(
+                model_parameters,
+                lr=optimizer_lr,
+                weight_decay=optimizer_weight_decay,
+                decouple_lr=True
+            )
+        except ImportError:
+            raise ImportError("You do not have optimī installed. Please install it using `pip install torch-optimi`")
     elif optimizer_name == "CAME":
-        optimizer = CAME(
-            model_parameters,
-            lr=optimizer_lr,
-            weight_decay=optimizer_weight_decay,
-        )
+        try:
+            from came_pytorch import CAME
+            # TODO: Make optional
+            optimizer = CAME(
+                model_parameters,
+                lr=optimizer_lr,
+                weight_decay=optimizer_weight_decay,
+                enable_stochastic_rounding=True,
+                enable_cautious=True,
+                enable_8bit=True,
+            )
+        except ImportError:
+            raise ImportError(
+                "You do not have CAME installed. "
+                "Please install it using `pip install came-pytorch @ git+https://github.com/xzuyn/CAME.git@sr-grams-cautious-8bit`"
+            )
+
     else:
-        optimizer = OptimiAdamW(
-            model_parameters,
-            lr=optimizer_lr,
-            weight_decay=optimizer_weight_decay,
-            decouple_lr=True,
-        )
+        raise RuntimeError("No valid optimizer selected. Falling back to OptimiAdamW.")
 
     return optimizer
 
@@ -551,7 +540,6 @@ def filter_data_chunk(chunk, processor):
 
 
 # Initialize components
-verify_optimizer_choice(config["optimizer"])
 model = AutoModelForCausalLM.from_pretrained(
     config["model_name"],
     torch_dtype=torch.bfloat16,
