@@ -489,7 +489,7 @@ def evaluate_model(
                         inputs["pixel_values"].shape[-1],
                     ),
                 )
-                # Log to wandb
+                # Log to wandb table
                 table.add_data(answer, parsed[prompt].replace("<pad>", ""))
                 print("\n----")
                 print("      Prompt:", prompt)
@@ -499,13 +499,7 @@ def evaluate_model(
             break
 
     avg_loss = total_loss / steps
-    run.log(
-        {
-            "validation/avg_loss": avg_loss,
-            "validation/predictions": table
-        },
-        step=current_step
-    )
+    run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
 
 
 def save_model_checkpoint(
