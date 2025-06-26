@@ -554,6 +554,7 @@ def filter_data_chunk(chunk, processor):
             print(f"Error processing {txt_path}: {e}")
     return filtered_chunk
 
+
 # Initialize components
 verify_optimizer_choice(config["optimizer"])
 model = AutoModelForCausalLM.from_pretrained(
