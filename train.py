@@ -491,7 +491,11 @@ def evaluate_model(
                 )
                 # Log to wandb
                 table.add_data(answer, parsed[prompt].replace("<pad>", ""))
-                print(f"\n----\n      Prompt: {prompt}\nGround Truth: {answer}\n  Prediction: {parsed[prompt].replace('<pad>', '')}\n----")
+                print("\n----")
+                print("      Prompt:", prompt)
+                print("Ground Truth:", answer)
+                print("  Prediction:", parsed[prompt].replace("<pad>", ""))
+                print("----")
             break
 
     avg_loss = total_loss / steps
