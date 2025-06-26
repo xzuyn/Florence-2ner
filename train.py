@@ -24,7 +24,7 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 
 # Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # Configuration parameters
@@ -356,14 +356,15 @@ def train_model(
                 # Create attention mask to ignore padding tokens
                 attention_mask = labels != tokenizer.pad_token_id
 
-                outputs = model(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    labels=labels,
-                    attention_mask=attention_mask
-                )
-                loss = outputs.loss
-                loss = loss / config["gradient_accumulation_steps"]
+                with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=False):
+                    outputs = model(
+                        input_ids=inputs["input_ids"],
+                        pixel_values=inputs["pixel_values"],
+                        labels=labels,
+                        attention_mask=attention_mask
+                    )
+                    loss = outputs.loss
+                    loss = loss / config["gradient_accumulation_steps"]
                 loss.backward()
 
                 if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
@@ -456,13 +457,14 @@ def evaluate_model(
             # Create attention mask for padding tokens
             attention_mask = labels != processor.tokenizer.pad_token_id
 
-            outputs = model(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                labels=labels,
-                attention_mask=attention_mask
-            )
-            total_loss += outputs.loss.item()
+            with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=False):
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
+                    labels=labels,
+                    attention_mask=attention_mask
+                )
+                total_loss += outputs.loss.item()
             steps += 1
 
         # Sample predictions (first batch only)
