@@ -37,7 +37,6 @@ config = {
     "learning_rate": 1e-6,
     "min_learning_rate": 1e-7,  # Currently only works with REX
     "lr_scheduler": "REX",  # Currently supports "Constant", "Cosine", and "REX"
-    "gradient_checkpointing": True,  # May have no effect
     "freeze_vision": False,
     "freeze_language": False,
     "freeze_other": False,
@@ -440,9 +439,6 @@ def evaluate_model(
     steps = 0
     table = wandb.Table(columns=["Ground Truth", "Prediction"])
 
-    if config["gradient_checkpointing"]:
-        model.config.use_cache = True
-
     # Loss computation
     with torch.no_grad():
         for tasks, inputs, answers in tqdm(val_loader, desc="Validation"):
@@ -506,9 +502,6 @@ def evaluate_model(
     avg_loss = total_loss / steps
     run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
 
-    if config["gradient_checkpointing"]:
-        model.config.use_cache = False
-
 
 def save_model_checkpoint(
     model,
@@ -517,9 +510,6 @@ def save_model_checkpoint(
     step,
     save_total_limit
 ):
-    if config["gradient_checkpointing"]:
-        model.config.use_cache = True
-
     output_dir = f"./checkpoints/{run_name}/step-{step}"
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
@@ -540,9 +530,6 @@ def save_model_checkpoint(
         for checkpoint_to_delete in checkpoints[:num_to_delete]:
             print(f"Deleting old checkpoint: {checkpoint_to_delete}")
             shutil.rmtree(checkpoint_to_delete)
-
-    if config["gradient_checkpointing"]:
-        model.config.use_cache = False
 
 
 def filter_data_chunk(chunk, processor):
@@ -574,10 +561,6 @@ model = AutoModelForCausalLM.from_pretrained(
 processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
 
 # TODO: Move all this to a function (enable_optimizations())
-# TODO: Verify if this works, and if unsloth/OneTrainer CPU offloaded checkpointing can be added
-if config["gradient_checkpointing"]:
-    model.gradient_checkpointing_enable()
-    model.config.use_cache = False
 if config["freeze_language"]:
     for param in model.language_model.parameters():
         param.requires_grad = False
