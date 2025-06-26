@@ -466,8 +466,7 @@ def evaluate_model(
                 total_loss += outputs.loss.item()
             steps += 1
 
-    # Sample predictions (first batch only)
-    with torch.no_grad():
+        # Sample predictions (first batch only)
         for tasks, inputs, answers in val_loader:
             generated_ids = model.generate(
                 input_ids=inputs["input_ids"],
