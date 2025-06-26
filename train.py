@@ -136,6 +136,7 @@ class RexLR(LRScheduler):
         rex_factor = self.min_lr / self.max_lr + (1.0 - self.min_lr / self.max_lr) * (
             z / (0.1 + 0.9 * z)
         )
+
         return [base_lr * rex_factor for base_lr in self.base_lrs]
 
 
@@ -151,17 +152,23 @@ class LocalImageTextDataset(Dataset):
         task_prompt, image_path, prompt_path = self.data_pairs[idx]
         try:
             image = Image.open(image_path)
+
             if image.mode != "RGB":
                 image = image.convert("RGB")
+
             with open(prompt_path, "r") as f:
                 answer = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
+
             return task_prompt, answer, image
         except Exception as e:
             raise RuntimeError(f"Error loading data from {image_path}: {e}")
 
 
 def get_all_files_by_prompt(dataset_config):
-    """Gather all (prompt, image, text) tuples from multiple directories per task."""
+    """
+    Gather all (prompt, image, text) tuples from multiple directories per task.
+    """
+
     all_pairs = []
     for task_prompt, dirs in dataset_config.items():
         for d in dirs:
@@ -172,7 +179,32 @@ def get_all_files_by_prompt(dataset_config):
                         txt_file = img_file.with_suffix(".txt")
                         if txt_file.exists():
                             all_pairs.append((task_prompt, img_file, txt_file))
+
     return all_pairs
+
+
+def filter_data_chunk(chunk, processor):
+    """
+    Filter a chunk of (task_prompt, image_path, text_path) tuples by token-length.
+    """
+
+    tokenizer = processor.tokenizer
+    filtered_chunk = []
+    for task_prompt, img_path, txt_path in chunk:
+        try:
+            with open(txt_path, "r") as f:
+                text = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
+
+            inputs = tokenizer(text, return_tensors="pt")
+
+            if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
+                filtered_chunk.append((task_prompt, img_path, txt_path))
+            else:
+                print(f"Caption too long: {img_path}")
+        except Exception as e:
+            print(f"Error processing {txt_path}: {e}")
+
+    return filtered_chunk
 
 
 def collate_fn(batch, processor):
@@ -324,12 +356,13 @@ def train_model(
 
     current_step = 0
     with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
-        evaluate_model(val_loader, model, processor, run, current_step)  # Evaluate at the beginning
+        # Evaluate before any training starts
+        evaluate_model(val_loader, model, processor, run, current_step)
 
         for epoch in range(config["epochs"]):
             model.train()
             progress_bar = tqdm(range(int(total_training_steps / config["epochs"])), desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]")
-            optimizer.zero_grad()  # Initialize gradients outside the inner loop
+            optimizer.zero_grad()
 
             for i, batch in enumerate(train_loader):
                 _, inputs, answers = batch
@@ -520,23 +553,6 @@ def save_model_checkpoint(
             print(f"Deleting old checkpoint: {checkpoint_to_delete}")
             shutil.rmtree(checkpoint_to_delete)
 
-
-def filter_data_chunk(chunk, processor):
-    """Filter a chunk of (task_prompt, image_path, text_path) tuples by token-length."""
-    filtered_chunk = []
-    tokenizer = processor.tokenizer
-    for task_prompt, img_path, txt_path in chunk:
-        try:
-            with open(txt_path, "r") as f:
-                text = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
-            inputs = tokenizer(text, return_tensors="pt")
-            if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
-                filtered_chunk.append((task_prompt, img_path, txt_path))
-            else:
-                print(f"Caption too long: {img_path}")
-        except Exception as e:
-            print(f"Error processing {txt_path}: {e}")
-    return filtered_chunk
 
 
 # Initialize components
