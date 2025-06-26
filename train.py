@@ -1,15 +1,20 @@
 import os
 import gc
-import json
-import random
-import multiprocessing
-from pathlib import Path
-import shutil
 import re
 import math
+import wandb
+import json
+import yaml
+import shutil
+import random
+import argparse
+import multiprocessing
+
+from transformers import AutoModelForCausalLM, AutoProcessor
+from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
-import wandb
+
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import (
@@ -19,49 +24,11 @@ from torch.optim.lr_scheduler import (
     SequentialLR,
     LRScheduler
 )
-from transformers import AutoModelForCausalLM, AutoProcessor
 
 
 # Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# Configuration parameters
-config = {
-    "model_name": "microsoft/Florence-2-base",
-    "wandb_project_name": "Florence-2-base",
-    "run_name": "",
-    "epochs": 2,  # I found 3 or more to start overfitting. 1 or 2 is a good default
-    "optimizer": "CAME",  # Currently supports "OptimiAdamW" & "CAME"
-    "learning_rate": 1e-6,
-    "min_learning_rate": 1e-7,  # Currently only works with REX
-    "lr_scheduler": "REX",  # Currently supports "Constant", "Cosine", and "REX"
-    "freeze_vision": False,
-    "freeze_language": False,
-    "freeze_other": False,
-    "train_batch_size": 8,
-    "eval_batch_size": 8,
-    "gradient_accumulation_steps": 8,
-    "clip_grad_norm": 0.5,
-    "weight_decay": 0.01,  # 1e-5 default for OptimiAdamW, 1e-2 default for CAME
-    "save_total_limit": 3,
-    "save_steps": 10,
-    "eval_steps": 10,
-    "warmup_steps": 50,
-    "eval_split": 0.1,
-    "seed": 42,
-    "filtering_processes": 128,
-    "attn_implementation": "sdpa",
-    "dataset_config": {
-        "<CAPTION>": [
-            "...",
-        ],
-        # "<DETAILED_CAPTION>": [
-        #     "...",
-        # ]
-    }
-}
 
 
 # https://github.com/IvanVassi/REX_LR
@@ -554,82 +521,103 @@ def save_model_checkpoint(
             shutil.rmtree(checkpoint_to_delete)
 
 
-
-# Initialize components
-model = AutoModelForCausalLM.from_pretrained(
-    config["model_name"],
-    torch_dtype=torch.bfloat16,
-    trust_remote_code=True,
-    attn_implementation=config["attn_implementation"],
-)
-processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
-
-# TODO: Move all this to a function (enable_optimizations())
-if config["freeze_language"]:
-    for param in model.language_model.parameters():
-        param.requires_grad = False
-if config["freeze_vision"]:
-    for param in model.vision_tower.parameters():
-        param.requires_grad = False
-if config["freeze_other"]:
-    model.image_pos_embed.column_embeddings.weight.requires_grad = False
-    model.image_pos_embed.row_embeddings.weight.requires_grad = False
-    model.visual_temporal_embed.pos_idx_to_embed.requires_grad = False
-    model.image_proj_norm.bias.requires_grad = False
-    model.image_proj_norm.weight.requires_grad = False
-    model.image_projection.requires_grad = False
-
-model.to(device)
-
-random.seed(config["seed"])
-torch.manual_seed(config["seed"])
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(config["seed"])
-
-# Gather and filter data
-print("Gathering files from multiple datasets...")
-all_pairs = get_all_files_by_prompt(config["dataset_config"])
-
-gc.collect()
-
-# Optimized filtering using multiprocessing
-print("Filtering data based on token length using multiprocessing...")
-with multiprocessing.Pool(processes=config["filtering_processes"]) as pool:
-    chunk_size = max(1, len(all_pairs) // config["filtering_processes"])
-    chunks = [all_pairs[i:i + chunk_size] for i in range(0, len(all_pairs), chunk_size)]
-    results = list(
-        tqdm(
-            pool.starmap(filter_data_chunk, [(chunk, processor) for chunk in chunks]),
-            total=len(chunks)
-        )
+def main():
+    parser = argparse.ArgumentParser(
+        description=" A simple Florence-2 finetuning script."
     )
-filtered_pairs = [item for sublist in results for item in sublist]
-print(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
 
-random.shuffle(filtered_pairs)
-eval_size = int(len(filtered_pairs) * config["eval_split"]) if config["eval_split"] < 1 else min(int(config["eval_split"]), len(filtered_pairs))
-eval_dataset_pairs = filtered_pairs[:eval_size]
-train_dataset_pairs = filtered_pairs[eval_size:]
+    parser.add_argument(
+        "yaml_file",
+        type=str,
+        help="Path to the yaml training config file."
+    )
 
-train_dataset = LocalImageTextDataset(train_dataset_pairs)
-# TODO: Add ability to specify a val set
-val_dataset = LocalImageTextDataset(eval_dataset_pairs)
+    args = parser.parse_args()
 
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=config["train_batch_size"],
-    collate_fn=lambda batch: collate_fn(batch, processor),
-    shuffle=True
-)
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=config["eval_batch_size"],
-    collate_fn=lambda batch: collate_fn(batch, processor)
-)
+    with open(args.yaml_file, "r") as f:
+        config = yaml.safe_load(f)
 
-torch.cuda.synchronize()
-torch.cuda.empty_cache()
-gc.collect()
+    # Initialize components
+    model = AutoModelForCausalLM.from_pretrained(
+        config["model_name"],
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation=config["attn_implementation"],
+    )
+    processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
 
-# Train the model
-train_model(train_loader, val_loader, model, processor, config)
+    if config["freeze_language"]:
+        for param in model.language_model.parameters():
+            param.requires_grad = False
+    if config["freeze_vision"]:
+        for param in model.vision_tower.parameters():
+            param.requires_grad = False
+    if config["freeze_other"]:
+        model.image_pos_embed.column_embeddings.weight.requires_grad = False
+        model.image_pos_embed.row_embeddings.weight.requires_grad = False
+        model.visual_temporal_embed.pos_idx_to_embed.requires_grad = False
+        model.image_proj_norm.bias.requires_grad = False
+        model.image_proj_norm.weight.requires_grad = False
+        model.image_projection.requires_grad = False
+
+    model.to(device)
+
+    random.seed(config["seed"])
+    torch.manual_seed(config["seed"])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config["seed"])
+
+    # Gather and filter data
+    print("Gathering files from multiple datasets...")
+    all_pairs = get_all_files_by_prompt(config["dataset_config"])
+
+    gc.collect()
+
+    # Optimized filtering using multiprocessing
+    print("Filtering data based on token length using multiprocessing...")
+    with multiprocessing.Pool(processes=config["filtering_processes"]) as pool:
+        chunk_size = max(1, len(all_pairs) // config["filtering_processes"])
+        chunks = [all_pairs[i:i + chunk_size] for i in range(0, len(all_pairs), chunk_size)]
+        results = list(
+            tqdm(
+                pool.starmap(filter_data_chunk, [(chunk, processor) for chunk in chunks]),
+                total=len(chunks)
+            )
+        )
+    filtered_pairs = [item for sublist in results for item in sublist]
+    print(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
+
+    random.shuffle(filtered_pairs)
+    eval_size = (
+        int(len(filtered_pairs) * config["eval_split"]) if config["eval_split"] < 1
+        else min(int(config["eval_split"]), len(filtered_pairs))
+    )
+    eval_dataset_pairs = filtered_pairs[:eval_size]
+    train_dataset_pairs = filtered_pairs[eval_size:]
+
+    train_dataset = LocalImageTextDataset(train_dataset_pairs)
+    # TODO: Add ability to specify a val set
+    val_dataset = LocalImageTextDataset(eval_dataset_pairs)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config["train_batch_size"],
+        collate_fn=lambda batch: collate_fn(batch, processor),
+        shuffle=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config["eval_batch_size"],
+        collate_fn=lambda batch: collate_fn(batch, processor)
+    )
+
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Train the model
+    train_model(train_loader, val_loader, model, processor, config)
+
+
+if __name__ == "__main__":
+    main()
