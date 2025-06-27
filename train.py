@@ -233,7 +233,6 @@ def prepare_optimizer(
                 "You do not have CAME installed. "
                 "Please install it using `pip install came-pytorch @ git+https://github.com/xzuyn/CAME.git@sr-grams-cautious-8bit`"
             )
-
     else:
         raise RuntimeError("No valid optimizer selected. Falling back to OptimiAdamW.")
 
@@ -344,7 +343,7 @@ def train_model(
                 # Create attention mask to ignore padding tokens
                 attention_mask = labels != tokenizer.pad_token_id
 
-                with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=False):
+                with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
                     outputs = model(
                         input_ids=inputs["input_ids"],
                         pixel_values=inputs["pixel_values"],
@@ -356,10 +355,6 @@ def train_model(
                 loss.backward()
 
                 if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                    gc.collect()
-
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
                     optimizer.step()
                     scheduler.step()
@@ -383,6 +378,11 @@ def train_model(
                             "grad_norm": grad_norm.item()
                         }
                     )
+
+                    del outputs, loss, attention_mask
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
                     if current_step % config["eval_steps"] == 0:
                         evaluate_model(
@@ -523,7 +523,7 @@ def save_model_checkpoint(
 
 def main():
     parser = argparse.ArgumentParser(
-        description=" A simple Florence-2 finetuning script."
+        description="A simple Florence-2 finetuning script."
     )
 
     parser.add_argument(
@@ -594,6 +594,20 @@ def main():
     )
     eval_dataset_pairs = filtered_pairs[:eval_size]
     train_dataset_pairs = filtered_pairs[eval_size:]
+
+    # Prepare output directory
+    output_base_dir = Path(f"./checkpoints/{config['run_name']}")
+    output_base_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save YAML file to output dir
+    shutil.copy(args.yaml_file, output_base_dir / Path(args.yaml_file).name)
+
+    # Save eval image paths
+    eval_list_file = output_base_dir / "eval_image_paths.txt"
+    with open(eval_list_file, "w") as f:
+        for _, img_path, _ in eval_dataset_pairs:
+            f.write(f"{img_path}\n")
+    print(f"Saved evaluation image paths to {eval_list_file}")
 
     train_dataset = LocalImageTextDataset(train_dataset_pairs)
     # TODO: Add ability to specify a val set
