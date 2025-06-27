@@ -559,6 +559,8 @@ def main():
         model.image_proj_norm.bias.requires_grad = False
         model.image_proj_norm.weight.requires_grad = False
         model.image_projection.requires_grad = False
+    if config["gradient_checkpointing"]:
+        model.gradient_checkpointing_enable()
 
     model.to(device)
 
