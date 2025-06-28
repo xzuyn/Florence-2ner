@@ -240,17 +240,18 @@ def safe_forward(model, inputs, labels, attention_mask, max_chunks=4):
                     )
                     losses.append(outputs.loss.detach())
 
-                avg_loss = torch.stack(losses).mean()
-                outputs.loss = avg_loss
+                outputs.loss = torch.stack(losses).mean()
                 return outputs
             except RuntimeError as e2:
                 if "out of memory" in str(e2).lower():
                     print(f"Still OOM at {num_chunks} chunks. Trying smaller.")
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                     gc.collect()
                     continue
                 else:
                     raise
+
         raise RuntimeError("OOM even after chunking. Try lowering batch size.")
 
 
@@ -398,6 +399,7 @@ def train_model(
                     return_tensors="pt",
                     padding="longest",
                     truncation=False,
+                    pad_to_multiple_of=16,
                     return_token_type_ids=False,
                 ).input_ids.to(device)
 
@@ -488,6 +490,7 @@ def evaluate_model(
                 text=answers,
                 return_tensors="pt",
                 padding="longest",
+                pad_to_multiple_of=16,
                 truncation=False,
             ).input_ids.to(device)
 
