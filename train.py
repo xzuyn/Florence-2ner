@@ -196,7 +196,7 @@ def collate_fn(batch, processor):
     return list(tasks), inputs, list(answers)
 
 
-def safe_forward(model, inputs, labels, attention_mask, max_chunks=1):
+def safe_forward(model, inputs, labels, attention_mask, max_chunks=4):
     """
     Tries to forward a batch. If OOM, retries with smaller chunks.
     """
@@ -623,6 +623,8 @@ def main():
     filtered_pairs = [item for sublist in results for item in sublist]
     print(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
 
+    del all_pairs, chunks, results
+
     random.shuffle(filtered_pairs)
     eval_size = (
         int(len(filtered_pairs) * config["eval_split"]) if config["eval_split"] < 1
@@ -630,6 +632,8 @@ def main():
     )
     eval_dataset_pairs = filtered_pairs[:eval_size]
     train_dataset_pairs = filtered_pairs[eval_size:]
+
+    del filtered_pairs
 
     # Prepare output directory
     output_base_dir = Path(f"./checkpoints/{config['run_name']}")
@@ -645,9 +649,13 @@ def main():
             f.write(f"{img_path}\n")
     print(f"Saved evaluation image paths to {eval_list_file}")
 
+    del eval_list_file
+
     train_dataset = LocalImageTextDataset(train_dataset_pairs)
     # TODO: Add ability to specify a val set
     val_dataset = LocalImageTextDataset(eval_dataset_pairs)
+
+    del train_dataset_pairs, eval_dataset_pairs
 
     train_loader = DataLoader(
         train_dataset,
@@ -660,6 +668,8 @@ def main():
         batch_size=config["eval_batch_size"],
         collate_fn=lambda batch: collate_fn(batch, processor)
     )
+
+    del train_dataset, val_dataset
 
     model = AutoModelForCausalLM.from_pretrained(
         config["model_name"],
