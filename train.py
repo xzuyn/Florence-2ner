@@ -196,6 +196,64 @@ def collate_fn(batch, processor):
     return list(tasks), inputs, list(answers)
 
 
+def safe_forward(model, inputs, labels, attention_mask, max_chunks=1):
+    """
+    Tries to forward a batch. If OOM, retries with smaller chunks.
+    """
+
+    try:
+        return model(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            labels=labels,
+            attention_mask=attention_mask
+        )
+    except RuntimeError as e:
+        if "out of memory" not in str(e).lower():
+            raise
+
+        print("Got OOM. Trying chunked forward pass.")
+
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        bsz = inputs["input_ids"].size(0)
+        for num_chunks in range(2, max_chunks + 1):
+            if bsz % num_chunks != 0:
+                continue  # only support clean splits for now
+            try:
+                chunk_size = bsz // num_chunks
+                losses = []
+
+                for i in range(num_chunks):
+                    sl = slice(i * chunk_size, (i + 1) * chunk_size)
+                    input_chunk = {k: v[sl] for k, v in inputs.items()}
+                    label_chunk = labels[sl]
+                    mask_chunk = attention_mask[sl]
+
+                    outputs = model(
+                        input_ids=input_chunk["input_ids"],
+                        pixel_values=input_chunk["pixel_values"],
+                        labels=label_chunk,
+                        attention_mask=mask_chunk
+                    )
+                    losses.append(outputs.loss.detach())
+
+                avg_loss = torch.stack(losses).mean()
+                outputs.loss = avg_loss
+                return outputs
+            except RuntimeError as e2:
+                if "out of memory" in str(e2).lower():
+                    print(f"Still OOM at {num_chunks} chunks. Trying smaller.")
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    continue
+                else:
+                    raise
+        raise RuntimeError("OOM even after chunking. Try lowering batch size.")
+
+
 # TODO: Add more optimizers
 # https://github.com/warner-benjamin/optimi
 # https://github.com/yangluo7/CAME
@@ -323,15 +381,18 @@ def train_model(
     current_step = 0
     with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
         # Evaluate before any training starts
-        evaluate_model(val_loader, model, processor, run, current_step)
+        evaluate_model(val_loader, model, processor, run, current_step, config)
 
         for epoch in range(config["epochs"]):
             model.train()
             progress_bar = tqdm(range(int(total_training_steps / config["epochs"])), desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]")
             optimizer.zero_grad()
 
-            for i, batch in enumerate(train_loader):
-                _, inputs, answers = batch
+            for i, (_, inputs, answers) in enumerate(train_loader):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                gc.collect()
+
                 labels = tokenizer(
                     text=answers,
                     return_tensors="pt",
@@ -344,14 +405,16 @@ def train_model(
                 attention_mask = labels != tokenizer.pad_token_id
 
                 with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
-                    outputs = model(
-                        input_ids=inputs["input_ids"],
-                        pixel_values=inputs["pixel_values"],
+                    outputs = safe_forward(
+                        model=model,
+                        inputs=inputs,
                         labels=labels,
-                        attention_mask=attention_mask
+                        attention_mask=attention_mask,
+                        max_chunks=config["train_batch_size"]
                     )
-                    loss = outputs.loss
-                    loss = loss / config["gradient_accumulation_steps"]
+                    loss = outputs.loss / config["gradient_accumulation_steps"]
+                    del inputs, answers, labels, attention_mask, outputs
+
                 loss.backward()
 
                 if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
@@ -379,19 +442,10 @@ def train_model(
                         }
                     )
 
-                    del outputs, loss, attention_mask
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                    del loss, scalar_loss, grad_norm
 
                     if current_step % config["eval_steps"] == 0:
-                        evaluate_model(
-                            val_loader,
-                            model,
-                            processor,
-                            run,
-                            current_step
-                        )
+                        evaluate_model(val_loader, model, processor, run, current_step, config)
 
                     if current_step % config["save_steps"] == 0:
                         save_model_checkpoint(
@@ -404,13 +458,7 @@ def train_model(
 
         # Eval the last step if it hasn't been already
         if current_step % config["eval_steps"] != 0:
-            evaluate_model(
-                val_loader,
-                model,
-                processor,
-                run,
-                current_step
-            )
+            evaluate_model(val_loader, model, processor, run, current_step, config)
 
         # Save the last checkpoint
         save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
@@ -421,7 +469,8 @@ def evaluate_model(
     model,
     processor,
     run,
-    current_step
+    current_step,
+    config
 ):
     model.eval()
     total_loss = 0
@@ -430,7 +479,7 @@ def evaluate_model(
 
     # Loss computation
     with torch.no_grad():
-        for tasks, inputs, answers in tqdm(val_loader, desc="Validation"):
+        for _, inputs, answers in tqdm(val_loader, desc="Validation"):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             gc.collect()
@@ -445,14 +494,17 @@ def evaluate_model(
             # Create attention mask for padding tokens
             attention_mask = labels != processor.tokenizer.pad_token_id
 
-            with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=False):
-                outputs = model(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
+            with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
+                outputs = safe_forward(
+                    model=model,
+                    inputs=inputs,
                     labels=labels,
-                    attention_mask=attention_mask
+                    attention_mask=attention_mask,
+                    max_chunks=config["eval_batch_size"]
                 )
                 total_loss += outputs.loss.item()
+                del inputs, answers, labels, attention_mask, outputs
+
             steps += 1
 
         # Sample predictions (first batch only)
@@ -490,6 +542,13 @@ def evaluate_model(
 
     avg_loss = total_loss / steps
     run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
+
+    del (
+        tasks, inputs, answers,
+        generated_ids, generated_texts,
+        prompt, gen_text, answer, parsed,
+        total_loss, avg_loss
+    )
 
 
 def save_model_checkpoint(
@@ -537,32 +596,7 @@ def main():
     with open(args.yaml_file, "r") as f:
         config = yaml.safe_load(f)
 
-    # Initialize components
-    model = AutoModelForCausalLM.from_pretrained(
-        config["model_name"],
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-        attn_implementation=config["attn_implementation"],
-    )
     processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
-
-    if config["freeze_language"]:
-        for param in model.language_model.parameters():
-            param.requires_grad = False
-    if config["freeze_vision"]:
-        for param in model.vision_tower.parameters():
-            param.requires_grad = False
-    if config["freeze_other"]:
-        model.image_pos_embed.column_embeddings.weight.requires_grad = False
-        model.image_pos_embed.row_embeddings.weight.requires_grad = False
-        model.visual_temporal_embed.pos_idx_to_embed.requires_grad = False
-        model.image_proj_norm.bias.requires_grad = False
-        model.image_proj_norm.weight.requires_grad = False
-        model.image_projection.requires_grad = False
-    if config["gradient_checkpointing"]:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
-
-    model.to(device)
 
     random.seed(config["seed"])
     torch.manual_seed(config["seed"])
@@ -626,6 +660,31 @@ def main():
         batch_size=config["eval_batch_size"],
         collate_fn=lambda batch: collate_fn(batch, processor)
     )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        config["model_name"],
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        attn_implementation=config["attn_implementation"],
+    )
+
+    if config["freeze_language"]:
+        for param in model.language_model.parameters():
+            param.requires_grad = False
+    if config["freeze_vision"]:
+        for param in model.vision_tower.parameters():
+            param.requires_grad = False
+    if config["freeze_other"]:
+        model.image_pos_embed.column_embeddings.weight.requires_grad = False
+        model.image_pos_embed.row_embeddings.weight.requires_grad = False
+        model.visual_temporal_embed.pos_idx_to_embed.requires_grad = False
+        model.image_proj_norm.bias.requires_grad = False
+        model.image_proj_norm.weight.requires_grad = False
+        model.image_projection.requires_grad = False
+    if config["gradient_checkpointing"]:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+
+    model.to(device)
 
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
