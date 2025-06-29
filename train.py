@@ -138,6 +138,7 @@ def get_all_files_by_prompt(dataset_config):
 
     all_pairs = []
     for task_prompt, dirs in dataset_config.items():
+        count = 0
         for d in dirs:
             for root, _, files in os.walk(d):
                 for file in files:
@@ -146,6 +147,8 @@ def get_all_files_by_prompt(dataset_config):
                         txt_file = img_file.with_suffix(".txt")
                         if txt_file.exists():
                             all_pairs.append((task_prompt, img_file, txt_file))
+                            count += 1
+        print(f"{task_prompt}: found {count} pairs")
 
     return all_pairs
 
