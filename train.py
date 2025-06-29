@@ -14,6 +14,7 @@ from transformers import AutoModelForCausalLM, AutoProcessor
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
+from functools import partial
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -29,6 +30,7 @@ from torch.optim.lr_scheduler import (
 # Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 # https://github.com/IvanVassi/REX_LR
@@ -191,7 +193,7 @@ def collate_fn(batch, processor):
             return_tensors="pt",
             padding="longest",
             truncation=False,
-        ).to(device, torch.bfloat16)
+        )
     except ValueError as e:
         print(f"Processor error: {e}")
         raise
@@ -409,6 +411,10 @@ def train_model(
                 # Create attention mask to ignore padding tokens
                 attention_mask = labels != tokenizer.pad_token_id
 
+                # Move inputs to device and cast pixel_values to bf16
+                inputs = inputs.to(device)
+                inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+
                 with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
                     outputs = safe_forward(
                         model=model,
@@ -461,6 +467,9 @@ def train_model(
                             config["save_total_limit"]
                         )
 
+            if config["save_on_epoch_too"]:
+                save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
+
         # Eval the last step if it hasn't been already
         if current_step % config["eval_steps"] != 0:
             evaluate_model(val_loader, model, processor, run, current_step, config)
@@ -500,6 +509,10 @@ def evaluate_model(
             # Create attention mask for padding tokens
             attention_mask = labels != processor.tokenizer.pad_token_id
 
+            # Move inputs to device and cast pixel_values to bf16
+            inputs = inputs.to(device)
+            inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+
             with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
                 outputs = safe_forward(
                     model=model,
@@ -513,8 +526,12 @@ def evaluate_model(
 
             steps += 1
 
-        # Sample predictions (first batch only)
+        # Sample predictions
         for tasks, inputs, answers in val_loader:
+            # Move inputs to device and cast pixel_values to bf16
+            inputs = inputs.to(device)
+            inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+
             generated_ids = model.generate(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
@@ -544,7 +561,7 @@ def evaluate_model(
                 print("Ground Truth:", answer)
                 print("  Prediction:", parsed[prompt].replace("<pad>", ""))
                 print("----")
-            break
+            break  # First batch only
 
     avg_loss = total_loss / steps
     run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
@@ -615,10 +632,12 @@ def main():
 
     gc.collect()
 
+    processes_count = int(os.cpu_count() * config["filtering_processes_per_thread"])
+
     # Optimized filtering using multiprocessing
-    print("Filtering data based on token length using multiprocessing...")
-    with multiprocessing.Pool(processes=config["filtering_processes"]) as pool:
-        chunk_size = max(1, len(all_pairs) // config["filtering_processes"])
+    print(f"Filtering data based on token length using multiprocessing with {processes_count} processes")
+    with multiprocessing.Pool(processes=processes_count, maxtasksperchild=processes_count) as pool:
+        chunk_size = max(1, len(all_pairs) // processes_count)
         chunks = [all_pairs[i:i + chunk_size] for i in range(0, len(all_pairs), chunk_size)]
         results = list(
             tqdm(
@@ -666,17 +685,22 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=config["train_batch_size"],
-        collate_fn=lambda batch: collate_fn(batch, processor),
-        shuffle=True
+        collate_fn=partial(collate_fn, processor=processor),
+        shuffle=True,
+        num_workers=os.cpu_count(),
+        pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=config["eval_batch_size"],
-        collate_fn=lambda batch: collate_fn(batch, processor)
+        collate_fn=partial(collate_fn, processor=processor),
+        num_workers=os.cpu_count(),
+        pin_memory=True,
     )
 
     del train_dataset, val_dataset
 
+    print("Loading model")
     model = AutoModelForCausalLM.from_pretrained(
         config["model_name"],
         torch_dtype=torch.bfloat16,
@@ -700,6 +724,7 @@ def main():
     if config["gradient_checkpointing"]:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
 
+    print(f"Moving model to {device}")
     model.to(device)
 
     torch.cuda.synchronize()
@@ -707,6 +732,7 @@ def main():
     gc.collect()
 
     # Train the model
+    print("Starting training")
     train_model(train_loader, val_loader, model, processor, config)
 
 
