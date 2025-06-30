@@ -545,6 +545,8 @@ def evaluate_model(
                 skip_special_tokens=False
             )
 
+            del generated_ids
+
             for prompt, gen_text, answer in zip(tasks, generated_texts, answers):
                 parsed = processor.post_process_generation(
                     gen_text,
@@ -561,17 +563,16 @@ def evaluate_model(
                 print("Ground Truth:", answer)
                 print("  Prediction:", parsed[prompt].replace("<pad>", ""))
                 print("----")
+
+                del parsed, prompt, gen_text, answer
+
+            del tasks, inputs, answers
+
             break  # First batch only
 
-    avg_loss = total_loss / steps
-    run.log({"validation/avg_loss": avg_loss, "validation/predictions": table}, step=current_step)
+    run.log({"validation/avg_loss": total_loss / steps, "validation/predictions": table}, step=current_step)
 
-    del (
-        tasks, inputs, answers,
-        generated_ids, generated_texts,
-        prompt, gen_text, answer, parsed,
-        total_loss, avg_loss
-    )
+    del total_loss
 
 
 def save_model_checkpoint(
