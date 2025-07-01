@@ -572,7 +572,7 @@ def evaluate_model(
 
     run.log({"validation/avg_loss": total_loss / steps, "validation/predictions": table}, step=current_step)
 
-    del total_loss
+    del table, total_loss
 
 
 def save_model_checkpoint(
@@ -633,7 +633,9 @@ def main():
 
     gc.collect()
 
-    processes_count = int(os.cpu_count() * config["filtering_processes_per_thread"])
+    processes_count = int(
+        (config["dataloader_workers"] or os.cpu_count()) * config["filtering_processes_per_thread"]
+    )
 
     # Optimized filtering using multiprocessing
     print(f"Filtering data based on token length using multiprocessing with {processes_count} processes")
@@ -685,18 +687,20 @@ def main():
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=config["train_batch_size"],
+        batch_size=int(config["train_batch_size"]),
         collate_fn=partial(collate_fn, processor=processor),
         shuffle=True,
-        num_workers=os.cpu_count(),
+        num_workers=int(config["dataloader_workers"]) or os.cpu_count(),
         pin_memory=True,
+        prefetch_factor=int(config["dataloader_prefetch_factor"]),
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config["eval_batch_size"],
+        batch_size=int(config["eval_batch_size"]),
         collate_fn=partial(collate_fn, processor=processor),
-        num_workers=os.cpu_count(),
+        num_workers=int(config["dataloader_workers"]) or os.cpu_count(),
         pin_memory=True,
+        prefetch_factor=int(config["dataloader_prefetch_factor"]),
     )
 
     del train_dataset, val_dataset
