@@ -23,6 +23,10 @@ warmup_steps: 20
 eval_split: 256
 seed: 42
 filtering_processes_per_thread: 1
+filtering_batch_size: 16
+dataloader_workers: 12
+persistent_workers: true
+dataloader_prefetch_factor: 4
 attn_implementation: sdpa
 dataset_config:
   <CAPTION>:
