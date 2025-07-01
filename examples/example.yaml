@@ -1,0 +1,35 @@
+model_name: microsoft/Florence-2-base
+wandb_project_name: Florence-2-base
+run_name: Florence-2-base-Example-v0.1-run1
+epochs: 2
+optimizer: CAME
+learning_rate: 0.0000025
+min_learning_rate: 0.00000025
+lr_scheduler: REX
+freeze_vision: false
+freeze_language: false
+freeze_other: false
+train_batch_size: 4
+eval_batch_size: 4
+gradient_accumulation_steps: 32
+gradient_checkpointing: true
+clip_grad_norm: 0.5
+weight_decay: 0.01
+save_total_limit: 3
+save_on_epoch_too: true
+save_steps: 10
+eval_steps: 10
+warmup_steps: 20
+eval_split: 256
+seed: 42
+filtering_processes_per_thread: 1
+filtering_batch_size: 16
+dataloader_workers: 12
+persistent_workers: true
+dataloader_prefetch_factor: 4
+attn_implementation: sdpa
+dataset_config:
+  <CAPTION>:
+    - "/media/xzuyn/NVMe/Datasets/Images/Example-Short"
+  <DETAILED_CAPTION>:
+    - "/media/xzuyn/NVMe/Datasets/Images/Example-Long"

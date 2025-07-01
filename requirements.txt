@@ -2,7 +2,7 @@ torch
 torchvision
 transformers
 torch-optimi
-came-pytorch
+came-pytorch @ git+https://github.com/xzuyn/CAME.git@sr-grams-cautious-8bit
 wandb
 pillow
 tqdm
