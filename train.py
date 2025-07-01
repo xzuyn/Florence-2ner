@@ -29,6 +29,7 @@ from torch.optim.lr_scheduler import (
 
 # Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -102,9 +103,7 @@ class RexLR(LRScheduler):
 
         mod_iter = step_after % remaining_steps
         z = (remaining_steps - mod_iter) / remaining_steps
-        rex_factor = self.min_lr / self.max_lr + (1.0 - self.min_lr / self.max_lr) * (
-            z / (0.1 + 0.9 * z)
-        )
+        rex_factor = self.min_lr / self.max_lr + (1.0 - self.min_lr / self.max_lr) * (z / (0.1 + 0.9 * z))
 
         return [base_lr * rex_factor for base_lr in self.base_lrs]
 
@@ -150,33 +149,61 @@ def get_all_files_by_prompt(dataset_config):
                         if txt_file.exists():
                             all_pairs.append((task_prompt, img_file, txt_file))
                             count += 1
+
         print(f"{task_prompt}: found {count} pairs")
 
     return all_pairs
 
 
 def filter_data_chunk(chunk, processor):
-    """
-    Filter a chunk of (task_prompt, image_path, text_path) tuples by token-length.
-    """
-
     tokenizer = processor.tokenizer
-    filtered_chunk = []
+
+    texts = []
+    meta = []
     for task_prompt, img_path, txt_path in chunk:
         try:
             with open(txt_path, "r") as f:
-                text = f.read().replace("  ", " ").strip()  # Remove double spaces, and strip
-
-            inputs = tokenizer(text, return_tensors="pt")
-
-            if inputs.input_ids.shape[1] <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
-                filtered_chunk.append((task_prompt, img_path, txt_path))
-            else:
-                print(f"Caption too long: {img_path}")
+                text = f.read().replace("  ", " ").strip()
+            texts.append(text)
+            meta.append((task_prompt, img_path, txt_path))
         except Exception as e:
-            print(f"Error processing {txt_path}: {e}")
+            print(f"Error reading {txt_path}: {e}")
 
-    return filtered_chunk
+    if not texts:
+        return []
+
+    tokenized = tokenizer(
+        texts,
+        padding=False,
+        truncation=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+
+    filtered = []
+    for (task_prompt, img_path, txt_path), ids in zip(meta, tokenized.input_ids):
+        length = len(ids)
+        if length <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
+            filtered.append((task_prompt, img_path, txt_path))
+        else:
+            print(f"Caption too long ({length} tokens): {img_path}")
+
+    return filtered
+
+
+def filter_all_pairs(all_pairs, processor, processes_count, batch_size=1):
+    batches = [all_pairs[i : i + batch_size] for i in range(0, len(all_pairs), batch_size)]
+
+    worker = partial(filter_data_chunk, processor=processor)
+
+    results = []
+    with multiprocessing.Pool(processes=processes_count, maxtasksperchild=None) as pool:
+        with tqdm(total=len(batches)) as pbar:
+            for chunk_result in pool.imap_unordered(worker, batches):
+                results.extend(chunk_result)
+                pbar.update()
+
+    return results
 
 
 def collate_fn(batch, processor):
@@ -637,21 +664,14 @@ def main():
         (config["dataloader_workers"] or os.cpu_count()) * config["filtering_processes_per_thread"]
     )
 
-    # Optimized filtering using multiprocessing
-    print(f"Filtering data based on token length using multiprocessing with {processes_count} processes")
-    with multiprocessing.Pool(processes=processes_count, maxtasksperchild=processes_count) as pool:
-        chunk_size = max(1, len(all_pairs) // processes_count)
-        chunks = [all_pairs[i:i + chunk_size] for i in range(0, len(all_pairs), chunk_size)]
-        results = list(
-            tqdm(
-                pool.starmap(filter_data_chunk, [(chunk, processor) for chunk in chunks]),
-                total=len(chunks)
-            )
-        )
-    filtered_pairs = [item for sublist in results for item in sublist]
+    print(
+        f"Filtering data based on token length using {processes_count} processes "
+        f"and batch size {int(config['filtering_batch_size'])}"
+    )
+    filtered_pairs = filter_all_pairs(all_pairs, processor, processes_count, int(config["filtering_batch_size"]))
     print(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
 
-    del all_pairs, chunks, results
+    del all_pairs
 
     random.shuffle(filtered_pairs)
     eval_size = (
@@ -691,6 +711,7 @@ def main():
         collate_fn=partial(collate_fn, processor=processor),
         shuffle=True,
         num_workers=int(config["dataloader_workers"]) or os.cpu_count(),
+        persistent_workers=config["persistent_workers"],
         pin_memory=True,
         prefetch_factor=int(config["dataloader_prefetch_factor"]),
     )
@@ -699,6 +720,7 @@ def main():
         batch_size=int(config["eval_batch_size"]),
         collate_fn=partial(collate_fn, processor=processor),
         num_workers=int(config["dataloader_workers"]) or os.cpu_count(),
+        persistent_workers=config["persistent_workers"],
         pin_memory=True,
         prefetch_factor=int(config["dataloader_prefetch_factor"]),
     )
