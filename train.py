@@ -53,7 +53,13 @@ class RexLR(LRScheduler):
     """
 
     def __init__(
-        self, optimizer, max_lr, min_lr, total_steps=0, num_warmup_steps=0, last_step=0
+        self,
+        optimizer,
+        max_lr,
+        min_lr,
+        total_steps=0,
+        num_warmup_steps=0,
+        last_step=0,
     ):
         if min_lr > max_lr:
             raise ValueError(
@@ -646,6 +652,8 @@ def main():
 
     with open(args.yaml_file, "r") as f:
         config = yaml.safe_load(f)
+
+    # TODO: Set default config values if setting is not present
 
     processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
 
