@@ -162,8 +162,6 @@ def get_all_files_by_prompt(dataset_config):
 
 
 def filter_data_chunk(chunk, processor):
-    tokenizer = processor.tokenizer
-
     texts = []
     meta = []
     for task_prompt, img_path, txt_path in chunk:
@@ -178,7 +176,7 @@ def filter_data_chunk(chunk, processor):
     if not texts:
         return []
 
-    tokenized = tokenizer(
+    tokenized = processor.tokenizer(
         texts,
         padding=False,
         truncation=False,
@@ -232,65 +230,6 @@ def collate_fn(batch, processor):
         raise
 
     return list(tasks), inputs, list(answers)
-
-
-def safe_forward(model, inputs, labels, attention_mask, max_chunks=4):
-    """
-    Tries to forward a batch. If OOM, retries with smaller chunks.
-    """
-
-    try:
-        return model(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs["pixel_values"],
-            labels=labels,
-            attention_mask=attention_mask
-        )
-    except RuntimeError as e:
-        if "out of memory" not in str(e).lower():
-            raise
-
-        print("Got OOM. Trying chunked forward pass.")
-
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        bsz = inputs["input_ids"].size(0)
-        for num_chunks in range(2, max_chunks + 1):
-            if bsz % num_chunks != 0:
-                continue  # only support clean splits for now
-            try:
-                chunk_size = bsz // num_chunks
-                losses = []
-
-                for i in range(num_chunks):
-                    sl = slice(i * chunk_size, (i + 1) * chunk_size)
-                    input_chunk = {k: v[sl] for k, v in inputs.items()}
-                    label_chunk = labels[sl]
-                    mask_chunk = attention_mask[sl]
-
-                    outputs = model(
-                        input_ids=input_chunk["input_ids"],
-                        pixel_values=input_chunk["pixel_values"],
-                        labels=label_chunk,
-                        attention_mask=mask_chunk
-                    )
-                    losses.append(outputs.loss.detach())
-
-                outputs.loss = torch.stack(losses).mean()
-                return outputs
-            except RuntimeError as e2:
-                if "out of memory" in str(e2).lower():
-                    print(f"Still OOM at {num_chunks} chunks. Trying smaller.")
-                    torch.cuda.synchronize()
-                    torch.cuda.empty_cache()
-                    gc.collect()
-                    continue
-                else:
-                    raise
-
-        raise RuntimeError("OOM even after chunking. Try lowering batch size.")
 
 
 # TODO: Add more optimizers
@@ -393,9 +332,13 @@ def train_model(
     val_loader,
     model,
     processor,
-    config
+    config,
+    run
 ):
-    tokenizer = processor.tokenizer
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
+
     optimizer = prepare_optimizer(
         model.parameters(),
         config["optimizer"],
@@ -418,115 +361,21 @@ def train_model(
     )
 
     current_step = 0
-    with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
-        # Evaluate before any training starts
-        evaluate_model(val_loader, model, processor, run, current_step, config)
 
-        for epoch in range(config["epochs"]):
-            model.train()
-            progress_bar = tqdm(range(int(total_training_steps / config["epochs"])), desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]")
-            optimizer.zero_grad()
+    # Evaluate before any training starts
+    evaluate_model(val_loader, model, processor, run, current_step)
 
-            for i, (_, inputs, answers) in enumerate(train_loader):
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                gc.collect()
+    for epoch in range(config["epochs"]):
+        model.train()
 
-                labels = tokenizer(
-                    text=answers,
-                    return_tensors="pt",
-                    padding="longest",
-                    truncation=False,
-                    pad_to_multiple_of=16,
-                    return_token_type_ids=False,
-                ).input_ids.to(device)
+        progress_bar = tqdm(
+            range(int(total_training_steps / config["epochs"])),
+            desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]"
+        )
 
-                # Create attention mask to ignore padding tokens
-                attention_mask = labels != tokenizer.pad_token_id
+        optimizer.zero_grad()
 
-                # Move inputs to device and cast pixel_values to bf16
-                inputs = inputs.to(device)
-                inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
-
-                with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
-                    outputs = safe_forward(
-                        model=model,
-                        inputs=inputs,
-                        labels=labels,
-                        attention_mask=attention_mask,
-                        max_chunks=config["train_batch_size"]
-                    )
-                    loss = outputs.loss / config["gradient_accumulation_steps"]
-                    del inputs, answers, labels, attention_mask, outputs
-
-                loss.backward()
-
-                if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-
-                    current_step += 1
-                    progress_bar.update(1)
-
-                    scalar_loss = loss.detach().item() * config["gradient_accumulation_steps"]
-                    run.log(
-                        {
-                            "train/loss": scalar_loss,
-                            "train/grad_norm": grad_norm.item(),
-                            "train/lr": optimizer.param_groups[0]["lr"],
-                            "train/epoch": current_step / (total_training_steps / config["epochs"])
-                        }
-                    )
-                    progress_bar.set_postfix(
-                        {
-                            "loss": scalar_loss,
-                            "grad_norm": grad_norm.item()
-                        }
-                    )
-
-                    del loss, scalar_loss, grad_norm
-
-                    if current_step % config["eval_steps"] == 0:
-                        evaluate_model(val_loader, model, processor, run, current_step, config)
-
-                    if current_step % config["save_steps"] == 0:
-                        save_model_checkpoint(
-                            model,
-                            processor,
-                            config["run_name"],
-                            current_step,
-                            config["save_total_limit"]
-                        )
-
-            if config["save_on_epoch_too"]:
-                save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
-
-        # Eval the last step if it hasn't been already
-        if current_step % config["eval_steps"] != 0:
-            evaluate_model(val_loader, model, processor, run, current_step, config)
-
-        # Save the last checkpoint
-        save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
-
-
-def evaluate_model(
-    val_loader,
-    model,
-    processor,
-    run,
-    current_step,
-    config
-):
-    model.eval()
-    total_loss = 0
-    steps = 0
-    table = wandb.Table(columns=["Ground Truth", "Prediction"])
-
-    # Loss computation
-    with torch.no_grad():
-        for _, inputs, answers in tqdm(val_loader, desc="Validation"):
+        for i, (_, inputs, answers) in enumerate(train_loader):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
             gc.collect()
@@ -535,11 +384,12 @@ def evaluate_model(
                 text=answers,
                 return_tensors="pt",
                 padding="longest",
-                pad_to_multiple_of=16,
                 truncation=False,
+                pad_to_multiple_of=16,
+                return_token_type_ids=False,
             ).input_ids.to(device)
 
-            # Create attention mask for padding tokens
+            # Create attention mask to ignore padding tokens
             attention_mask = labels != processor.tokenizer.pad_token_id
 
             # Move inputs to device and cast pixel_values to bf16
@@ -547,61 +397,162 @@ def evaluate_model(
             inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
 
             with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
-                outputs = safe_forward(
-                    model=model,
-                    inputs=inputs,
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    pixel_values=inputs["pixel_values"],
                     labels=labels,
-                    attention_mask=attention_mask,
-                    max_chunks=config["eval_batch_size"]
+                    attention_mask=attention_mask
                 )
-                total_loss += outputs.loss.item()
+                loss = outputs.loss / config["gradient_accumulation_steps"]
                 del inputs, answers, labels, attention_mask, outputs
 
-            steps += 1
+            loss.backward()
 
-        # Sample predictions
-        for tasks, inputs, answers in val_loader:
-            # Move inputs to device and cast pixel_values to bf16
-            inputs = inputs.to(device)
-            inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+            if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
 
-            generated_ids = model.generate(
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                current_step += 1
+                progress_bar.update(1)
+
+                scalar_loss = loss.detach().item() * config["gradient_accumulation_steps"]
+                run.log(
+                    {
+                        "train/loss": scalar_loss,
+                        "train/grad_norm": grad_norm.item(),
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/epoch": current_step / (total_training_steps / config["epochs"])
+                    }
+                )
+                progress_bar.set_postfix(
+                    {
+                        "loss": scalar_loss,
+                        "grad_norm": grad_norm.item()
+                    }
+                )
+
+                del loss, scalar_loss, grad_norm
+
+                if current_step % config["eval_steps"] == 0:
+                    evaluate_model(val_loader, model, processor, run, current_step)
+
+                if current_step % config["save_steps"] == 0:
+                    save_model_checkpoint(
+                        model,
+                        processor,
+                        config["run_name"],
+                        current_step,
+                        config["save_total_limit"]
+                    )
+
+        if config["save_on_epoch_too"]:
+            save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
+
+    # Eval the last step if it hasn't been already
+    if current_step % config["eval_steps"] != 0:
+        evaluate_model(val_loader, model, processor, run, current_step)
+
+    # Save the last checkpoint
+    save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
+
+
+@torch.no_grad()
+def evaluate_model(
+    val_loader,
+    model,
+    processor,
+    run,
+    current_step,
+):
+    model.eval()
+    total_loss = 0
+    steps = 0
+    table = wandb.Table(columns=["Ground Truth", "Prediction"])
+
+    # Loss computation
+    for _, inputs, answers in tqdm(val_loader, desc="Validation"):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        labels = processor.tokenizer(
+            text=answers,
+            return_tensors="pt",
+            padding="longest",
+            pad_to_multiple_of=16,
+            truncation=False,
+        ).input_ids.to(device)
+
+        # Create attention mask for padding tokens
+        attention_mask = labels != processor.tokenizer.pad_token_id
+
+        # Move inputs to device and cast pixel_values to bf16
+        inputs = inputs.to(device)
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+
+        with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
+            outputs = model(
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
-                max_new_tokens=1024,
-                num_beams=5,
-                min_p=0.05,
-                do_sample=True
+                labels=labels,
+                attention_mask=attention_mask
             )
-            generated_texts = processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=False
+            total_loss += outputs.loss.item()
+            del inputs, answers, labels, attention_mask, outputs
+
+        steps += 1
+
+    # Sample predictions
+    for tasks, inputs, answers in val_loader:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Move inputs to device and cast pixel_values to bf16
+        inputs = inputs.to(device)
+        inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+
+        generated_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=1024,
+            num_beams=5,
+            min_p=0.05,
+            do_sample=True
+        )
+        generated_texts = processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=False
+        )
+
+        del generated_ids
+
+        for prompt, gen_text, answer in zip(tasks, generated_texts, answers):
+            parsed = processor.post_process_generation(
+                gen_text,
+                task=prompt,
+                image_size=(
+                    inputs["pixel_values"].shape[-2],
+                    inputs["pixel_values"].shape[-1],
+                ),
             )
 
-            del generated_ids
+            # Log to wandb table
+            table.add_data(answer, parsed[prompt].replace("<pad>", ""))
+            print("\n----")
+            print("      Prompt:", prompt)
+            print("Ground Truth:", answer)
+            print("  Prediction:", parsed[prompt].replace("<pad>", ""))
+            print("----")
 
-            for prompt, gen_text, answer in zip(tasks, generated_texts, answers):
-                parsed = processor.post_process_generation(
-                    gen_text,
-                    task=prompt,
-                    image_size=(
-                        inputs["pixel_values"].shape[-2],
-                        inputs["pixel_values"].shape[-1],
-                    ),
-                )
-                # Log to wandb table
-                table.add_data(answer, parsed[prompt].replace("<pad>", ""))
-                print("\n----")
-                print("      Prompt:", prompt)
-                print("Ground Truth:", answer)
-                print("  Prediction:", parsed[prompt].replace("<pad>", ""))
-                print("----")
+            del parsed, prompt, gen_text, answer
 
-                del parsed, prompt, gen_text, answer
+        del tasks, inputs, answers
 
-            del tasks, inputs, answers
-
-            break  # First batch only
+        break  # First batch only
 
     run.log({"validation/avg_loss": total_loss / steps, "validation/predictions": table}, step=current_step)
 
@@ -762,13 +713,12 @@ def main():
     print(f"Moving model to {device}")
     model.to(device)
 
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    gc.collect()
-
     # Train the model
-    print("Starting training")
-    train_model(train_loader, val_loader, model, processor, config)
+    with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
+        wandb.save(args.yaml_file)
+
+        print("Starting training")
+        train_model(train_loader, val_loader, model, processor, config, run)
 
 
 if __name__ == "__main__":
