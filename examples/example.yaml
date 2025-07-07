@@ -1,35 +1,53 @@
-model_name: microsoft/Florence-2-base
+# Project Settings
 wandb_project_name: Florence-2-base
 run_name: Florence-2-base-Example-v0.1-run1
+
+# Model Settings
+model_name: microsoft/Florence-2-base
+attn_implementation: sdpa
+use_bf16: true
+
+# Save & Eval Settings
+save_steps: 10
+eval_steps: 10
+save_total_limit: 3
+save_on_epoch_too: true
+do_extra_eval: true
+print_first_batch_predictions: true
+
+# Hyperparameter Settings
 epochs: 2
 optimizer: CAME
+lr_scheduler: REX
 learning_rate: 0.0000025
 min_learning_rate: 0.00000025
-lr_scheduler: REX
+train_batch_size: 4
+eval_batch_size: 4
+gradient_accumulation_steps: 16
+gradient_checkpointing: true
+warmup_steps: 20
+clip_grad_norm: 0.5
+weight_decay: 0.01
+seed: 42
+
+# Freezing Settings
 freeze_vision: false
 freeze_language: false
 freeze_other: false
-train_batch_size: 4
-eval_batch_size: 4
-gradient_accumulation_steps: 32
-gradient_checkpointing: true
-clip_grad_norm: 0.5
-weight_decay: 0.01
-save_total_limit: 3
-save_on_epoch_too: true
-save_steps: 10
-eval_steps: 10
-warmup_steps: 20
+
+# Dataset Settings
 eval_split: 256
-seed: 42
-filtering_processes_per_thread: 1
-filtering_batch_size: 16
-dataloader_workers: 12
-persistent_workers: true
-dataloader_prefetch_factor: 4
-attn_implementation: sdpa
 dataset_config:
   <CAPTION>:
     - "/media/xzuyn/NVMe/Datasets/Images/Example-Short"
   <DETAILED_CAPTION>:
     - "/media/xzuyn/NVMe/Datasets/Images/Example-Long"
+
+# Filtering Settings
+filtering_processes_per_thread: 1
+filtering_batch_size: 16
+
+# Dataloader Settings
+dataloader_workers: 12
+persistent_workers: true
+dataloader_prefetch_factor: 8
