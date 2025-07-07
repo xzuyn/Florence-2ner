@@ -8,6 +8,7 @@ import yaml
 import shutil
 import random
 import argparse
+import evaluate
 import multiprocessing
 
 from transformers import AutoModelForCausalLM, AutoProcessor
@@ -52,15 +53,7 @@ class RexLR(LRScheduler):
         last_step (int): The index of last step.
     """
 
-    def __init__(
-        self,
-        optimizer,
-        max_lr,
-        min_lr,
-        total_steps=0,
-        num_warmup_steps=0,
-        last_step=0,
-    ):
+    def __init__(self, optimizer, max_lr, min_lr, total_steps=0, num_warmup_steps=0, last_step=0):
         if min_lr > max_lr:
             raise ValueError(
                 f'Value of "min_lr" should be less than value of "max_lr". Got min_lr={min_lr} and max_lr={max_lr}'
@@ -235,12 +228,7 @@ def collate_fn(batch, processor):
 # TODO: Add more optimizers
 # https://github.com/warner-benjamin/optimi
 # https://github.com/yangluo7/CAME
-def prepare_optimizer(
-    model_parameters,
-    optimizer_name,
-    optimizer_lr,
-    optimizer_weight_decay
-):
+def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_weight_decay):
     if optimizer_name == "OptimiAdamW":
         try:
             from optimi import AdamW as OptimiAdamW
@@ -267,7 +255,7 @@ def prepare_optimizer(
         except ImportError:
             raise ImportError(
                 "You do not have CAME installed. "
-                "Please install it using `pip install came-pytorch @ git+https://github.com/xzuyn/CAME.git@sr-grams-cautious-8bit`"
+                "Please install it using `pip install git+https://github.com/xzuyn/CAME.git@sr-grams-cautious-8bit`"
             )
     else:
         raise RuntimeError("No valid optimizer selected. Falling back to OptimiAdamW.")
@@ -327,246 +315,12 @@ def prepare_lr_scheduler(
     return scheduler
 
 
-def train_model(
-    train_loader,
-    val_loader,
-    model,
-    processor,
-    config,
-    run
-):
+def save_model_checkpoint(model, processor, run_name, train_steps, save_total_limit):
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
 
-    optimizer = prepare_optimizer(
-        model.parameters(),
-        config["optimizer"],
-        config["learning_rate"],
-        config["weight_decay"]
-    )
-
-    # Calculate total training steps
-    total_training_steps = math.ceil(len(train_loader) / config["gradient_accumulation_steps"]) * config["epochs"]
-    if len(train_loader) % config["gradient_accumulation_steps"] != 0:
-        total_training_steps += 1
-
-    scheduler = prepare_lr_scheduler(
-        optimizer,
-        config["lr_scheduler"],
-        config["learning_rate"],
-        config["min_learning_rate"],
-        config["warmup_steps"],
-        total_training_steps
-    )
-
-    current_step = 0
-
-    # Evaluate before any training starts
-    evaluate_model(val_loader, model, processor, run, current_step)
-
-    for epoch in range(config["epochs"]):
-        model.train()
-
-        progress_bar = tqdm(
-            range(int(total_training_steps / config["epochs"])),
-            desc=f"Training [Epoch {epoch + 1}/{config['epochs']}]"
-        )
-
-        optimizer.zero_grad()
-
-        for i, (_, inputs, answers) in enumerate(train_loader):
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            gc.collect()
-
-            labels = processor.tokenizer(
-                text=answers,
-                return_tensors="pt",
-                padding="longest",
-                truncation=False,
-                pad_to_multiple_of=16,
-                return_token_type_ids=False,
-            ).input_ids.to(device)
-
-            # Create attention mask to ignore padding tokens
-            attention_mask = labels != processor.tokenizer.pad_token_id
-
-            # Move inputs to device and cast pixel_values to bf16
-            inputs = inputs.to(device)
-            inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
-
-            with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
-                outputs = model(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=inputs["pixel_values"],
-                    labels=labels,
-                    attention_mask=attention_mask
-                )
-                loss = outputs.loss / config["gradient_accumulation_steps"]
-                del inputs, answers, labels, attention_mask, outputs
-
-            loss.backward()
-
-            if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
-
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-                current_step += 1
-                progress_bar.update(1)
-
-                scalar_loss = loss.detach().item() * config["gradient_accumulation_steps"]
-                run.log(
-                    {
-                        "train/loss": scalar_loss,
-                        "train/grad_norm": grad_norm.item(),
-                        "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/epoch": current_step / (total_training_steps / config["epochs"])
-                    }
-                )
-                progress_bar.set_postfix(
-                    {
-                        "loss": scalar_loss,
-                        "grad_norm": grad_norm.item()
-                    }
-                )
-
-                del loss, scalar_loss, grad_norm
-
-                if current_step % config["eval_steps"] == 0:
-                    evaluate_model(val_loader, model, processor, run, current_step)
-
-                if current_step % config["save_steps"] == 0:
-                    save_model_checkpoint(
-                        model,
-                        processor,
-                        config["run_name"],
-                        current_step,
-                        config["save_total_limit"]
-                    )
-
-        if config["save_on_epoch_too"]:
-            save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
-
-    # Eval the last step if it hasn't been already
-    if current_step % config["eval_steps"] != 0:
-        evaluate_model(val_loader, model, processor, run, current_step)
-
-    # Save the last checkpoint
-    save_model_checkpoint(model, processor, config["run_name"], current_step, config["save_total_limit"])
-
-
-@torch.no_grad()
-def evaluate_model(
-    val_loader,
-    model,
-    processor,
-    run,
-    current_step,
-):
-    model.eval()
-    total_loss = 0
-    steps = 0
-    table = wandb.Table(columns=["Ground Truth", "Prediction"])
-
-    # Loss computation
-    for _, inputs, answers in tqdm(val_loader, desc="Validation"):
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        labels = processor.tokenizer(
-            text=answers,
-            return_tensors="pt",
-            padding="longest",
-            pad_to_multiple_of=16,
-            truncation=False,
-        ).input_ids.to(device)
-
-        # Create attention mask for padding tokens
-        attention_mask = labels != processor.tokenizer.pad_token_id
-
-        # Move inputs to device and cast pixel_values to bf16
-        inputs = inputs.to(device)
-        inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
-
-        with torch.amp.autocast(device_type=device, dtype=torch.bfloat16, cache_enabled=True):
-            outputs = model(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                labels=labels,
-                attention_mask=attention_mask
-            )
-            total_loss += outputs.loss.item()
-            del inputs, answers, labels, attention_mask, outputs
-
-        steps += 1
-
-    # Sample predictions
-    for tasks, inputs, answers in val_loader:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
-
-        # Move inputs to device and cast pixel_values to bf16
-        inputs = inputs.to(device)
-        inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
-
-        generated_ids = model.generate(
-            input_ids=inputs["input_ids"],
-            pixel_values=inputs["pixel_values"],
-            max_new_tokens=1024,
-            num_beams=5,
-            min_p=0.05,
-            do_sample=True
-        )
-        generated_texts = processor.batch_decode(
-            generated_ids,
-            skip_special_tokens=False
-        )
-
-        del generated_ids
-
-        for prompt, gen_text, answer in zip(tasks, generated_texts, answers):
-            parsed = processor.post_process_generation(
-                gen_text,
-                task=prompt,
-                image_size=(
-                    inputs["pixel_values"].shape[-2],
-                    inputs["pixel_values"].shape[-1],
-                ),
-            )
-
-            # Log to wandb table
-            table.add_data(answer, parsed[prompt].replace("<pad>", ""))
-            print("\n----")
-            print("      Prompt:", prompt)
-            print("Ground Truth:", answer)
-            print("  Prediction:", parsed[prompt].replace("<pad>", ""))
-            print("----")
-
-            del parsed, prompt, gen_text, answer
-
-        del tasks, inputs, answers
-
-        break  # First batch only
-
-    run.log({"validation/avg_loss": total_loss / steps, "validation/predictions": table}, step=current_step)
-
-    del table, total_loss
-
-
-def save_model_checkpoint(
-    model,
-    processor,
-    run_name,
-    step,
-    save_total_limit
-):
-    output_dir = f"./checkpoints/{run_name}/step-{step}"
+    output_dir = f"./checkpoints/{run_name}/step-{train_steps}"
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
     processor.save_pretrained(output_dir)
@@ -588,6 +342,260 @@ def save_model_checkpoint(
             shutil.rmtree(checkpoint_to_delete)
 
 
+@torch.inference_mode()
+def run_generate(model, input_ids, pixel_values):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return model.generate(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        max_new_tokens=1024,
+        num_beams=5,
+        min_p=0.05,
+        do_sample=True,
+    )
+
+
+@torch.inference_mode()
+def run_forward(model, input_ids, pixel_values, labels, attention_mask):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    return model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        labels=labels,
+        attention_mask=attention_mask,
+    ).loss.item()
+
+
+def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, grad_acc_steps):
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    loss = model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        labels=labels,
+        attention_mask=attention_mask,
+    ).loss / grad_acc_steps
+    loss.backward()
+
+    return loss
+
+
+def train_model(train_loader, val_loader, model, model_dtype, processor, config, run):
+    # Calculate total training steps
+    total_training_steps = math.ceil(len(train_loader) / config["gradient_accumulation_steps"]) * config["epochs"]
+    if len(train_loader) % config["gradient_accumulation_steps"] != 0:
+        total_training_steps += 1
+
+    optimizer = prepare_optimizer(
+        model.parameters(),
+        config["optimizer"],
+        config["learning_rate"],
+        config["weight_decay"]
+    )
+
+    scheduler = prepare_lr_scheduler(
+        optimizer,
+        config["lr_scheduler"],
+        config["learning_rate"],
+        config["min_learning_rate"],
+        config["warmup_steps"],
+        total_training_steps
+    )
+
+    train_steps = 0
+
+    # Evaluate before any training starts
+    evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+
+    model.train()
+    optimizer.zero_grad()
+
+    progress_bar = tqdm(range(total_training_steps), desc="Training")
+    for epoch in range(config["epochs"]):
+        for i, (_, inputs, answers) in enumerate(train_loader):
+            labels = processor.tokenizer(
+                text=answers,
+                return_tensors="pt",
+                padding="longest",
+                truncation=False,
+                pad_to_multiple_of=16,
+                return_token_type_ids=False,
+            ).input_ids.to(device)
+
+            # Create attention mask to ignore padding tokens
+            attention_mask = labels != processor.tokenizer.pad_token_id
+
+            # Move inputs to device and cast pixel_values to bf16 or fp16
+            inputs = inputs.to(device)
+            inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
+
+            loss = run_forward_backward(
+                model=model,
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"],
+                labels=labels,
+                attention_mask=attention_mask,
+                grad_acc_steps=config["gradient_accumulation_steps"],
+            )
+
+            del inputs, answers, labels, attention_mask
+
+            if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
+
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                scalar_loss = loss.detach().item() * config["gradient_accumulation_steps"]
+
+                train_steps += 1
+                progress_bar.update(1)
+                progress_bar.set_postfix(
+                    {
+                        "loss": scalar_loss,
+                        "grad_norm": grad_norm.item()
+                    }
+                )
+
+                run.log(
+                    {
+                        "train/loss": scalar_loss,
+                        "train/grad_norm": grad_norm.item(),
+                        "train/lr": optimizer.param_groups[0]["lr"],
+                        "train/epoch": train_steps / (total_training_steps / config["epochs"])
+                    }
+                )
+
+                del loss, scalar_loss, grad_norm
+
+                if train_steps % config["eval_steps"] == 0:
+                    evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+
+                if train_steps % config["save_steps"] == 0:
+                    save_model_checkpoint(
+                        model,
+                        processor,
+                        config["run_name"],
+                        train_steps,
+                        config["save_total_limit"]
+                    )
+
+        # Save on epoch if it hasn't been already
+        if train_steps % config["save_steps"] != 0:
+            save_model_checkpoint(model, processor, config["run_name"], train_steps, config["save_total_limit"])
+
+    # Eval the last step if it hasn't been already
+    if train_steps % config["eval_steps"] != 0:
+        evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+
+
+@torch.inference_mode()
+def evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps):
+    if config["do_extra_eval"]:
+        rouge_metric = evaluate.load("rouge")
+        google_bleu_metric = evaluate.load("google_bleu")
+        meteor_metric = evaluate.load("meteor")
+
+    # Loss computation
+    evaluation_values = {
+        "loss": 0.0,
+        "rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0,
+        "google_bleu": 0.0, "meteor": 0.0,
+    } if config["do_extra_eval"] else {"loss": 0.0}
+
+    model.eval()
+
+    eval_progress_bar = tqdm(range(len(val_loader)), desc="Validating")
+    for val_idx, (tasks, inputs, answers) in enumerate(val_loader):
+        labels = processor.tokenizer(
+            text=answers,
+            return_tensors="pt",
+            padding="longest",
+            pad_to_multiple_of=16,
+            truncation=False,
+        ).input_ids.to(device)
+
+        # Create attention mask for padding tokens
+        attention_mask = labels != processor.tokenizer.pad_token_id
+
+        # Move inputs to device and cast pixel_values to bf16 or fp16
+        inputs = inputs.to(device)
+        inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
+
+        evaluation_values["loss"] += run_forward(
+            model=model,
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            labels=labels,
+            attention_mask=attention_mask
+        )
+
+        if config["do_extra_eval"] or (config["print_first_batch_predictions"] and val_idx == 0):
+            # TODO: Decide if garbage collection should be done here too
+            generated_ids = run_generate(
+                model=model,
+                input_ids=inputs["input_ids"],
+                pixel_values=inputs["pixel_values"]
+            )
+
+            predictions = [
+                gen_text.strip() for gen_text in processor.batch_decode(generated_ids, skip_special_tokens=True)
+            ]
+
+            if config["do_extra_eval"]:
+                for rouge_type, rouge_value in rouge_metric.compute(
+                    references=answers,
+                    predictions=predictions,
+                    rouge_types=["rouge1", "rouge2", "rougeL"]
+                ).items():
+                    evaluation_values[rouge_type] += rouge_value
+
+                evaluation_values["google_bleu"] += google_bleu_metric.compute(
+                    references=answers,
+                    predictions=predictions
+                )["google_bleu"]
+                evaluation_values["meteor"] += meteor_metric.compute(
+                    references=answers,
+                    predictions=predictions
+                )["meteor"]
+
+            # Print the predictions of the first batch only
+            if config["print_first_batch_predictions"] and val_idx == 0:
+                for task, prediction, answer in zip(tasks, predictions, answers):
+                    print("\n----")
+                    print("        Task:", task)
+                    print("Ground Truth:", answer)
+                    print("  Prediction:", prediction)
+                    print("----")
+
+        eval_progress_bar.update(1)
+
+    if config["do_extra_eval"]:
+        del rouge_metric, google_bleu_metric, meteor_metric
+
+    wandb_data = {
+        "validation/avg_loss": evaluation_values["loss"] / len(val_loader),
+        "validation/avg_google_bleu": evaluation_values["google_bleu"] / len(val_loader),
+        "validation/avg_meteor": evaluation_values["meteor"] / len(val_loader),
+        "validation/avg_rouge1": evaluation_values["rouge1"] / len(val_loader),
+        "validation/avg_rouge2": evaluation_values["rouge2"] / len(val_loader),
+        "validation/avg_rougeL": evaluation_values["rougeL"] / len(val_loader),
+    } if config["do_extra_eval"] else {"validation/avg_loss": evaluation_values["loss"] / len(val_loader)}
+
+    run.log(wandb_data, step=train_steps)
+
+    model.train()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="A simple Florence-2 finetuning script."
@@ -606,6 +614,7 @@ def main():
 
     # TODO: Set default config values if setting is not present
 
+    model_dtype = torch.bfloat16 if config["use_bf16"] else torch.float16
     processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
 
     random.seed(config["seed"])
@@ -689,7 +698,7 @@ def main():
     print("Loading model")
     model = AutoModelForCausalLM.from_pretrained(
         config["model_name"],
-        torch_dtype=torch.bfloat16,
+        torch_dtype=model_dtype,
         trust_remote_code=True,
         attn_implementation=config["attn_implementation"],
     )
@@ -718,7 +727,7 @@ def main():
         wandb.save(args.yaml_file)
 
         print("Starting training")
-        train_model(train_loader, val_loader, model, processor, config, run)
+        train_model(train_loader, val_loader, model, model_dtype, processor, config, run)
 
 
 if __name__ == "__main__":
