@@ -496,10 +496,10 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
             if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
                 if config["debug"]:
                     logger.info("DEBUG - Clipping grad_norm")
-                for p in model.parameters():
-                    if p.grad is not None:
-                        p.grad /= window_token_count
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    config["clip_grad_norm"] * window_token_count
+                )
 
                 if config["debug"]:
                     logger.info("DEBUG - Stepping optimizer & scheduler")
@@ -507,32 +507,27 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
                 scheduler.step()
                 optimizer.zero_grad()
 
-                if config["debug"]:
-                    logger.info("DEBUG - Creating scalar_loss")
-                scalar_loss = window_loss_sum / window_token_count
-                window_loss_sum = 0.0
-                window_token_count = 0
-
                 train_steps += 1
                 progress_bar.update(1)
                 progress_bar.set_postfix(
                     {
                         "epoch": train_steps / (total_training_steps / config["epochs"]),
-                        "loss": scalar_loss,
-                        "grad_norm": grad_norm.item()
+                        "loss": window_loss_sum / window_token_count,
+                        "grad_norm": grad_norm.item() / window_token_count
                     }
                 )
 
                 run.log(
                     {
-                        "train/loss": scalar_loss,
-                        "train/grad_norm": grad_norm.item(),
+                        "train/loss": window_loss_sum / window_token_count,
+                        "train/grad_norm": grad_norm.item() / window_token_count,
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/epoch": train_steps / (total_training_steps / config["epochs"])
                     }
                 )
 
-                del loss_sum, scalar_loss, grad_norm
+                window_loss_sum = 0.0
+                window_token_count = 0
 
                 if train_steps % config["save_steps"] == 0:
                     save_model_checkpoint(
