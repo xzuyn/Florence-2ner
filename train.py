@@ -391,12 +391,17 @@ def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
         torch.cuda.empty_cache()
         gc.collect()
 
-    return model(
+    outputs = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
         labels=labels,
         attention_mask=attention_mask,
-    ).loss.item()
+    )
+
+    batch_token_count = attention_mask.sum()
+    loss_sum = outputs.loss * batch_token_count
+
+    return loss_sum.detach().item(), batch_token_count.item()
 
 
 # https://unsloth.ai/blog/gradient
@@ -561,7 +566,8 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
 
     all_references = []
     all_predictions = []
-    total_eval_loss = 0.0
+    eval_window_loss_sum = 0.0
+    eval_window_token_count = 0
 
     logger.info("Setting model to eval mode")
     model.eval()
@@ -586,7 +592,7 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
 
         if config["debug"]:
             logger.info("DEBUG - Running forward")
-        total_eval_loss += run_forward(
+        eval_loss_sum, eval_token_count = run_forward(
             model=model,
             input_ids=inputs["input_ids"],
             pixel_values=inputs["pixel_values"],
@@ -594,6 +600,8 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
             attention_mask=(labels != processor.tokenizer.pad_token_id),
             do_gc=config["do_gc"],
         )
+        eval_window_loss_sum += eval_loss_sum
+        eval_window_token_count += eval_token_count
 
         if config["do_extra_eval"] or (config["print_first_batch_predictions"] and val_idx == 0):
             if config["debug"]:
@@ -629,10 +637,9 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
                     print("----")
 
         eval_progress_bar.update(1)
+        eval_progress_bar.set_postfix({"loss": eval_loss_sum / eval_token_count})
 
-    wandb_data = {
-        "validation/avg_loss": total_eval_loss / len(val_loader)
-    }
+    wandb_data = {"validation/avg_loss": eval_window_loss_sum / eval_window_token_count}
 
     if config["do_extra_eval"]:
         logger.info("Loading extra evaluation metrics")
