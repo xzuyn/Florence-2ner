@@ -33,7 +33,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
     handlers=[
-        logging.FileHandler("run.log"),
+        logging.FileHandler("florence_log.log"),
         logging.StreamHandler()
     ],
     force=True,
@@ -242,6 +242,8 @@ def collate_fn(batch, processor):
 # https://github.com/warner-benjamin/optimi
 # https://github.com/yangluo7/CAME
 def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_weight_decay):
+    logger.info("Preparing optimizer")
+
     if optimizer_name == "OptimiAdamW":
         try:
             from optimi import AdamW as OptimiAdamW
@@ -289,6 +291,8 @@ def prepare_lr_scheduler(
     scheduler_warmup_steps,
     scheduler_total_training_steps
 ):
+    logger.info("Preparing lr_scheduler")
+
     if scheduler_name == "Constant":
         main_scheduler = ConstantLR(
             scheduler_optimizer
@@ -332,9 +336,7 @@ def prepare_lr_scheduler(
 
 
 def save_model_checkpoint(model, processor, run_name, train_steps, save_total_limit):
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    gc.collect()
+    logger.info("Saving checkpoint")
 
     output_dir = f"./checkpoints/{run_name}/step-{train_steps}"
     os.makedirs(output_dir, exist_ok=True)
@@ -405,6 +407,8 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
 
 
 def train_model(train_loader, val_loader, model, model_dtype, processor, config, run):
+    logger.info("Starting training")
+
     # Calculate total training steps
     total_training_steps = math.ceil(len(train_loader) / config["gradient_accumulation_steps"]) * config["epochs"]
     if len(train_loader) % config["gradient_accumulation_steps"] != 0:
@@ -516,17 +520,17 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
 
 @torch.inference_mode()
 def evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps):
+    logger.info("Starting evaluation")
+
     if config["do_extra_eval"]:
+        logger.info("Loading extra evaluation metrics")
         google_bleu_metric = evaluate.load("google_bleu")
         meteor_metric = evaluate.load("meteor")
         rouge_metric = evaluate.load("rouge")
+        all_references = []
+        all_predictions = []
 
-    # Loss computation
-    evaluation_values = {
-        "loss": 0.0,
-        "google_bleu": 0.0, "meteor": 0.0,
-        "rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0,
-    } if config["do_extra_eval"] else {"loss": 0.0}
+    total_eval_loss = 0.0
 
     model.eval()
 
@@ -547,7 +551,7 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
         inputs = inputs.to(device)
         inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
 
-        evaluation_values["loss"] += run_forward(
+        total_eval_loss += run_forward(
             model=model,
             input_ids=inputs["input_ids"],
             pixel_values=inputs["pixel_values"],
@@ -567,20 +571,8 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
             ]
 
             if config["do_extra_eval"]:
-                evaluation_values["google_bleu"] += google_bleu_metric.compute(
-                    references=answers,
-                    predictions=predictions
-                )["google_bleu"]
-                evaluation_values["meteor"] += meteor_metric.compute(
-                    references=answers,
-                    predictions=predictions
-                )["meteor"]
-                for rouge_type, rouge_value in rouge_metric.compute(
-                    references=answers,
-                    predictions=predictions,
-                    rouge_types=["rouge1", "rouge2", "rougeL"]
-                ).items():
-                    evaluation_values[rouge_type] += rouge_value
+                all_predictions.extend(predictions)
+                all_references.extend(answers)
 
             # Print the predictions of the first batch only
             if config["print_first_batch_predictions"] and val_idx == 0:
@@ -593,17 +585,38 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
 
         eval_progress_bar.update(1)
 
-    if config["do_extra_eval"]:
-        del rouge_metric, google_bleu_metric, meteor_metric
-
     wandb_data = {
-        "validation/avg_loss": evaluation_values["loss"] / len(val_loader),
-        "validation/avg_google_bleu": evaluation_values["google_bleu"] / len(val_loader),
-        "validation/avg_meteor": evaluation_values["meteor"] / len(val_loader),
-        "validation/avg_rouge1": evaluation_values["rouge1"] / len(val_loader),
-        "validation/avg_rouge2": evaluation_values["rouge2"] / len(val_loader),
-        "validation/avg_rougeL": evaluation_values["rougeL"] / len(val_loader),
-    } if config["do_extra_eval"] else {"validation/avg_loss": evaluation_values["loss"] / len(val_loader)}
+        "validation/avg_loss": total_eval_loss / len(val_loader)
+    }
+
+    if config["do_extra_eval"]:
+        logger.info("Running extra evaluation metrics")
+
+        avg_google_bleu = google_bleu_metric.compute(
+            predictions=all_predictions,
+            references=all_references
+        )
+        avg_meteor = meteor_metric.compute(
+            predictions=all_predictions,
+            references=all_references
+        )
+        avg_rouge = rouge_metric.compute(
+            predictions=all_predictions,
+            references=all_references,
+            rouge_types=["rouge1", "rouge2", "rougeL"]
+        )
+
+        wandb_data.update(
+            {
+                "validation/avg_google_bleu": avg_google_bleu["google_bleu"],
+                "validation/avg_meteor": avg_meteor["meteor"],
+                "validation/avg_rouge1": avg_rouge["rouge1"],
+                "validation/avg_rouge2": avg_rouge["rouge2"],
+                "validation/avg_rougeL": avg_rouge["rougeL"],
+            }
+        )
+
+        del google_bleu_metric, meteor_metric, rouge_metric, all_references, all_predictions
 
     run.log(wandb_data, step=train_steps)
 
@@ -737,7 +750,6 @@ def main():
     with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
         wandb.save(args.yaml_file)
 
-        logger.info("Starting training")
         train_model(train_loader, val_loader, model, model_dtype, processor, config, run)
 
 
