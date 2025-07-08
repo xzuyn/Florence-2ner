@@ -51,4 +51,4 @@ filtering_batch_size: 16
 # Dataloader Settings
 dataloader_workers: 12
 persistent_workers: true
-dataloader_prefetch_factor: 8
+dataloader_prefetch_factor: 2
