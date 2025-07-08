@@ -5,8 +5,10 @@ import math
 import wandb
 import json
 import yaml
+import torch
 import shutil
 import random
+import logging
 import argparse
 import evaluate
 import multiprocessing
@@ -17,7 +19,6 @@ from PIL import Image
 from tqdm import tqdm
 from functools import partial
 
-import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.optim.lr_scheduler import (
     ConstantLR,
@@ -27,6 +28,17 @@ from torch.optim.lr_scheduler import (
     LRScheduler
 )
 
+
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("run.log"),
+        logging.StreamHandler()
+    ],
+    force=True,
+)
+logger = logging.getLogger()
 
 # Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
@@ -128,7 +140,8 @@ class LocalImageTextDataset(Dataset):
 
             return task_prompt, answer, image
         except Exception as e:
-            raise RuntimeError(f"Error loading data from {image_path}: {e}")
+            logger.exception(f"Error loading data from {image_path}: {e}")
+            raise
 
 
 def get_all_files_by_prompt(dataset_config):
@@ -149,7 +162,7 @@ def get_all_files_by_prompt(dataset_config):
                             all_pairs.append((task_prompt, img_file, txt_file))
                             count += 1
 
-        print(f"{task_prompt}: found {count} pairs")
+        logger.info(f"{task_prompt}: found {count} pairs")
 
     return all_pairs
 
@@ -164,7 +177,7 @@ def filter_data_chunk(chunk, processor):
             texts.append(text)
             meta.append((task_prompt, img_path, txt_path))
         except Exception as e:
-            print(f"Error reading {txt_path}: {e}")
+            logger.exception(f"Error reading {txt_path}: {e}")
 
     if not texts:
         return []
@@ -183,7 +196,7 @@ def filter_data_chunk(chunk, processor):
         if length <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
             filtered.append((task_prompt, img_path, txt_path))
         else:
-            print(f"Caption too long ({length} tokens): {img_path}")
+            logger.warning(f"Caption too long ({length} tokens): {img_path}")
 
     return filtered
 
@@ -219,7 +232,7 @@ def collate_fn(batch, processor):
             truncation=False,
         )
     except ValueError as e:
-        print(f"Processor error: {e}")
+        logger.exception(f"Processor error: {e}")
         raise
 
     return list(tasks), inputs, list(answers)
@@ -239,7 +252,8 @@ def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_
                 decouple_lr=True
             )
         except ImportError:
-            raise ImportError("You do not have optimī installed. Please install it using `pip install torch-optimi`")
+            logger.exception("You do not have optimī installed. Please install it using `pip install torch-optimi`")
+            raise
     elif optimizer_name == "CAME":
         try:
             from came_pytorch import CAME
@@ -253,12 +267,14 @@ def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_
                 enable_8bit=True,
             )
         except ImportError:
-            raise ImportError(
+            logger.exception(
                 "You do not have CAME installed. "
                 "Please install it using `pip install git+https://github.com/xzuyn/CAME.git@sr-grams-cautious-8bit`"
             )
+            raise
     else:
-        raise RuntimeError("No valid optimizer selected. Falling back to OptimiAdamW.")
+        logger.error("No valid optimizer selected. Options are: `OptimiAdamW` & `CAME`.")
+        raise
 
     return optimizer
 
@@ -291,7 +307,7 @@ def prepare_lr_scheduler(
             num_warmup_steps=scheduler_warmup_steps
         )
     else:
-        print("No valid LR scheduler selected. Falling back to Cosine.")
+        logger.warning("No valid LR scheduler selected. Falling back to Cosine.")
         main_scheduler = CosineAnnealingLR(
             scheduler_optimizer,
             T_max=(scheduler_total_training_steps - scheduler_warmup_steps) + 1
@@ -338,7 +354,7 @@ def save_model_checkpoint(model, processor, run_name, train_steps, save_total_li
     if len(checkpoints) > save_total_limit:
         num_to_delete = len(checkpoints) - save_total_limit
         for checkpoint_to_delete in checkpoints[:num_to_delete]:
-            print(f"Deleting old checkpoint: {checkpoint_to_delete}")
+            logger.info(f"Deleting old checkpoint: {checkpoint_to_delete}")
             shutil.rmtree(checkpoint_to_delete)
 
 
@@ -501,15 +517,15 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
 @torch.inference_mode()
 def evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps):
     if config["do_extra_eval"]:
-        rouge_metric = evaluate.load("rouge")
         google_bleu_metric = evaluate.load("google_bleu")
         meteor_metric = evaluate.load("meteor")
+        rouge_metric = evaluate.load("rouge")
 
     # Loss computation
     evaluation_values = {
         "loss": 0.0,
-        "rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0,
         "google_bleu": 0.0, "meteor": 0.0,
+        "rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0,
     } if config["do_extra_eval"] else {"loss": 0.0}
 
     model.eval()
@@ -540,7 +556,6 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
         )
 
         if config["do_extra_eval"] or (config["print_first_batch_predictions"] and val_idx == 0):
-            # TODO: Decide if garbage collection should be done here too
             generated_ids = run_generate(
                 model=model,
                 input_ids=inputs["input_ids"],
@@ -552,13 +567,6 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
             ]
 
             if config["do_extra_eval"]:
-                for rouge_type, rouge_value in rouge_metric.compute(
-                    references=answers,
-                    predictions=predictions,
-                    rouge_types=["rouge1", "rouge2", "rougeL"]
-                ).items():
-                    evaluation_values[rouge_type] += rouge_value
-
                 evaluation_values["google_bleu"] += google_bleu_metric.compute(
                     references=answers,
                     predictions=predictions
@@ -567,6 +575,12 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
                     references=answers,
                     predictions=predictions
                 )["meteor"]
+                for rouge_type, rouge_value in rouge_metric.compute(
+                    references=answers,
+                    predictions=predictions,
+                    rouge_types=["rouge1", "rouge2", "rougeL"]
+                ).items():
+                    evaluation_values[rouge_type] += rouge_value
 
             # Print the predictions of the first batch only
             if config["print_first_batch_predictions"] and val_idx == 0:
@@ -610,9 +624,12 @@ def main():
     args = parser.parse_args()
 
     with open(args.yaml_file, "r") as f:
+        # TODO: Set default config values if setting is not present
         config = yaml.safe_load(f)
 
-    # TODO: Set default config values if setting is not present
+    # Prepare output directory
+    output_base_dir = Path(f"./checkpoints/{config['run_name']}")
+    output_base_dir.mkdir(parents=True, exist_ok=True)
 
     model_dtype = torch.bfloat16 if config["use_bf16"] else torch.float16
     processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
@@ -623,21 +640,19 @@ def main():
         torch.cuda.manual_seed_all(config["seed"])
 
     # Gather and filter data
-    print("Gathering files from multiple datasets...")
+    logger.info("Gathering files from multiple datasets...")
     all_pairs = get_all_files_by_prompt(config["dataset_config"])
-
-    gc.collect()
 
     processes_count = int(
         (config["dataloader_workers"] or os.cpu_count()) * config["filtering_processes_per_thread"]
     )
 
-    print(
+    logger.info(
         f"Filtering data based on token length using {processes_count} processes "
         f"and batch size {int(config['filtering_batch_size'])}"
     )
     filtered_pairs = filter_all_pairs(all_pairs, processor, processes_count, int(config["filtering_batch_size"]))
-    print(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
+    logger.info(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
 
     del all_pairs
 
@@ -651,10 +666,6 @@ def main():
 
     del filtered_pairs
 
-    # Prepare output directory
-    output_base_dir = Path(f"./checkpoints/{config['run_name']}")
-    output_base_dir.mkdir(parents=True, exist_ok=True)
-
     # Save YAML file to output dir
     shutil.copy(args.yaml_file, output_base_dir / Path(args.yaml_file).name)
 
@@ -663,7 +674,7 @@ def main():
     with open(eval_list_file, "w") as f:
         for _, img_path, _ in eval_dataset_pairs:
             f.write(f"{img_path}\n")
-    print(f"Saved evaluation image paths to {eval_list_file}")
+    logger.info(f"Saved evaluation image paths to {eval_list_file}")
 
     del eval_list_file
 
@@ -695,7 +706,7 @@ def main():
 
     del train_dataset, val_dataset
 
-    print("Loading model")
+    logger.info("Loading model")
     model = AutoModelForCausalLM.from_pretrained(
         config["model_name"],
         torch_dtype=model_dtype,
@@ -719,14 +730,14 @@ def main():
     if config["gradient_checkpointing"]:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
 
-    print(f"Moving model to {device}")
+    logger.info(f"Moving model to {device}")
     model.to(device)
 
     # Train the model
     with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
         wandb.save(args.yaml_file)
 
-        print("Starting training")
+        logger.info("Starting training")
         train_model(train_loader, val_loader, model, model_dtype, processor, config, run)
 
 
