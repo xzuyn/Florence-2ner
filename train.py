@@ -39,6 +39,7 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger()
+logger.info("NEW RUN STARTED")
 
 # Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
@@ -282,7 +283,6 @@ def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_
 
 
 # TODO: Add more LR schedulers
-# TODO: Properly solve learning rate spiking on last few steps
 def prepare_lr_scheduler(
     scheduler_optimizer,
     scheduler_name,
@@ -361,10 +361,11 @@ def save_model_checkpoint(model, processor, run_name, train_steps, save_total_li
 
 
 @torch.inference_mode()
-def run_generate(model, input_ids, pixel_values):
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    gc.collect()
+def run_generate(model, input_ids, pixel_values, do_gc):
+    if do_gc:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
 
     return model.generate(
         input_ids=input_ids,
@@ -377,10 +378,11 @@ def run_generate(model, input_ids, pixel_values):
 
 
 @torch.inference_mode()
-def run_forward(model, input_ids, pixel_values, labels, attention_mask):
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    gc.collect()
+def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
+    if do_gc:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
 
     return model(
         input_ids=input_ids,
@@ -390,10 +392,11 @@ def run_forward(model, input_ids, pixel_values, labels, attention_mask):
     ).loss.item()
 
 
-def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, grad_acc_steps):
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    gc.collect()
+def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, grad_acc_steps, do_gc):
+    if do_gc:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
 
     loss = model(
         input_ids=input_ids,
@@ -435,7 +438,9 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
     # Evaluate before any training starts
     evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
 
+    logger.info("Setting model to train mode")
     model.train()
+
     optimizer.zero_grad()
 
     progress_bar = tqdm(range(total_training_steps), desc="Training")
@@ -464,6 +469,7 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
                 labels=labels,
                 attention_mask=attention_mask,
                 grad_acc_steps=config["gradient_accumulation_steps"],
+                do_gc=config["do_gc"],
             )
 
             del inputs, answers, labels, attention_mask
@@ -522,16 +528,11 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
 def evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps):
     logger.info("Starting evaluation")
 
-    if config["do_extra_eval"]:
-        logger.info("Loading extra evaluation metrics")
-        google_bleu_metric = evaluate.load("google_bleu")
-        meteor_metric = evaluate.load("meteor")
-        rouge_metric = evaluate.load("rouge")
-        all_references = []
-        all_predictions = []
-
+    all_references = []
+    all_predictions = []
     total_eval_loss = 0.0
 
+    logger.info("Setting model to eval mode")
     model.eval()
 
     eval_progress_bar = tqdm(range(len(val_loader)), desc="Validating")
@@ -556,14 +557,16 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
             input_ids=inputs["input_ids"],
             pixel_values=inputs["pixel_values"],
             labels=labels,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            do_gc=config["do_gc"],
         )
 
         if config["do_extra_eval"] or (config["print_first_batch_predictions"] and val_idx == 0):
             generated_ids = run_generate(
                 model=model,
                 input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"]
+                pixel_values=inputs["pixel_values"],
+                do_gc=config["do_gc"],
             )
 
             predictions = [
@@ -590,16 +593,22 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
     }
 
     if config["do_extra_eval"]:
-        logger.info("Running extra evaluation metrics")
+        logger.info("Loading extra evaluation metrics")
+        google_bleu_metric = evaluate.load("google_bleu")
+        meteor_metric = evaluate.load("meteor")
+        rouge_metric = evaluate.load("rouge")
 
+        logger.info("Running google_bleu eval")
         avg_google_bleu = google_bleu_metric.compute(
             predictions=all_predictions,
             references=all_references
         )
+        logger.info("Running meteor eval")
         avg_meteor = meteor_metric.compute(
             predictions=all_predictions,
             references=all_references
         )
+        logger.info("Running rouge eval")
         avg_rouge = rouge_metric.compute(
             predictions=all_predictions,
             references=all_references,
@@ -618,8 +627,10 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
 
         del google_bleu_metric, meteor_metric, rouge_metric, all_references, all_predictions
 
+    logger.info("Logging evaluation metrics to W&B")
     run.log(wandb_data, step=train_steps)
 
+    logger.info("Setting model to train mode")
     model.train()
 
 
@@ -639,6 +650,7 @@ def main():
     with open(args.yaml_file, "r") as f:
         # TODO: Set default config values if setting is not present
         config = yaml.safe_load(f)
+        logger.info(str(config))
 
     # Prepare output directory
     output_base_dir = Path(f"./checkpoints/{config['run_name']}")
@@ -669,6 +681,7 @@ def main():
 
     del all_pairs
 
+    logger.info("Shuffing and splitting train/eval splits")
     random.shuffle(filtered_pairs)
     eval_size = (
         int(len(filtered_pairs) * config["eval_split"]) if config["eval_split"] < 1
@@ -684,10 +697,10 @@ def main():
 
     # Save eval image paths
     eval_list_file = output_base_dir / "eval_image_paths.txt"
+    logger.info(f"Saving evaluation image paths to {eval_list_file}")
     with open(eval_list_file, "w") as f:
         for _, img_path, _ in eval_dataset_pairs:
             f.write(f"{img_path}\n")
-    logger.info(f"Saved evaluation image paths to {eval_list_file}")
 
     del eval_list_file
 
@@ -697,6 +710,7 @@ def main():
 
     del train_dataset_pairs, eval_dataset_pairs
 
+    logger.info("Loading dataloaders")
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(config["train_batch_size"]),
@@ -740,6 +754,7 @@ def main():
         model.image_proj_norm.bias.requires_grad = False
         model.image_proj_norm.weight.requires_grad = False
         model.image_projection.requires_grad = False
+
     if config["gradient_checkpointing"]:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
 
