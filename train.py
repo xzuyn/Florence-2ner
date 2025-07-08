@@ -37,6 +37,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def logger_setup(run_name, file_location):
+    global logger
+
     logging.basicConfig(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         level=logging.INFO,
@@ -446,9 +448,9 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
     optimizer.zero_grad()
 
     progress_bar = tqdm(range(total_training_steps), desc="Training")
-    for epoch in range(config["epochs"]):
+    for epoch in range(config.get("epochs")):
         for i, (_, inputs, answers) in enumerate(train_loader):
-            if config["debug"]:
+            if config.get("debug"):
                 logger.info("DEBUG - Creating labels")
             labels = processor.tokenizer(
                 text=answers,
@@ -460,12 +462,12 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
             ).input_ids.to(device)
 
             # Move inputs to device and cast pixel_values to bf16 or fp16
-            if config["debug"]:
+            if config.get("debug"):
                 logger.info("DEBUG - Moving inputs")
             inputs = inputs.to(device)
             inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
 
-            if config["debug"]:
+            if config.get("debug"):
                 logger.info("DEBUG - Running forward & backward")
             loss_sum, token_count = run_forward_backward(
                 model=model,
@@ -473,22 +475,22 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                 pixel_values=inputs["pixel_values"],
                 labels=labels,
                 attention_mask=(labels != processor.tokenizer.pad_token_id),  # type: ignore[attr-defined]
-                do_gc=config["do_gc"],
+                do_gc=config.get("do_gc"),
             )
             window_loss_sum += loss_sum
             window_token_count += token_count
 
             del inputs, answers, labels
 
-            if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
-                if config["debug"]:
+            if (i + 1) % config.get("gradient_accumulation_steps") == 0 or (i + 1) == len(train_loader):
+                if config.get("debug"):
                     logger.info("DEBUG - Clipping grad_norm")
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
-                    config["clip_grad_norm"] * window_token_count
+                    config.get("clip_grad_norm") * window_token_count
                 )
 
-                if config["debug"]:
+                if config.get("debug"):
                     logger.info("DEBUG - Stepping optimizer & scheduler")
                 optimizer.step()
                 scheduler.step()
@@ -498,7 +500,7 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                 progress_bar.update(1)
                 progress_bar.set_postfix(
                     {
-                        "epoch": train_steps / (total_training_steps / config["epochs"]),
+                        "epoch": train_steps / (total_training_steps / config.get("epochs")),
                         "loss": window_loss_sum / window_token_count,
                         "grad_norm": grad_norm.item() / window_token_count
                     }
@@ -509,29 +511,29 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                         "train/loss": window_loss_sum / window_token_count,
                         "train/grad_norm": grad_norm.item() / window_token_count,
                         "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/epoch": train_steps / (total_training_steps / config["epochs"])
+                        "train/epoch": train_steps / (total_training_steps / config.get("epochs"))
                     }
                 )
 
                 window_loss_sum = 0.0
                 window_token_count = 0
 
-                if train_steps % config["save_steps"] == 0:
+                if train_steps % config.get("save_steps") == 0:
                     save_model_checkpoint(
                         model,
                         processor,
-                        config["run_name"],
+                        config.get("run_name"),
                         train_steps,
-                        config["save_total_limit"]
+                        config.get("save_total_limit")
                     )
 
-                if train_steps % config["eval_steps"] == 0:
+                if train_steps % config.get("eval_steps") == 0:
                     evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps)
                     logger.info("Setting model to train mode")
                     model.train()
 
     # Eval the last step if it hasn't been already
-    if train_steps % config["eval_steps"] != 0:
+    if train_steps % config.get("eval_steps") != 0:
         evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps)
         logger.info("Setting model to train mode")
         model.train()
@@ -556,7 +558,7 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
 
     eval_progress_bar = tqdm(range(len(val_loader)), desc="Validating")
     for val_idx, (tasks, inputs, answers) in enumerate(val_loader):
-        if config["debug"]:
+        if config.get("debug"):
             logger.info("DEBUG - Creating labels")
         labels = processor.tokenizer(
             text=answers,
@@ -567,12 +569,12 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
         ).input_ids.to(device)
 
         # Move inputs to device and cast pixel_values to bf16 or fp16
-        if config["debug"]:
+        if config.get("debug"):
             logger.info("DEBUG - Moving inputs")
         inputs = inputs.to(device)
         inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
 
-        if config["debug"]:
+        if config.get("debug"):
             logger.info("DEBUG - Running forward")
         eval_loss_sum, eval_token_count = run_forward(
             model=model,
@@ -580,36 +582,36 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
             pixel_values=inputs["pixel_values"],
             labels=labels,
             attention_mask=(labels != processor.tokenizer.pad_token_id),  # type: ignore[attr-defined]
-            do_gc=config["do_gc"],
+            do_gc=config.get("do_gc"),
         )
         eval_window_loss_sum += eval_loss_sum
         eval_window_token_count += eval_token_count
 
-        if config["do_extra_eval"] or (config["print_first_batch_predictions"] and val_idx == 0):
-            if config["debug"]:
+        if config.get("do_extra_eval") or (config.get("print_first_batch_predictions") and val_idx == 0):
+            if config.get("debug"):
                 logger.info("DEBUG - Running generate")
             generated_ids = run_generate(
                 model=model,
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
-                do_gc=config["do_gc"],
+                do_gc=config.get("do_gc"),
             )
 
-            if config["debug"]:
+            if config.get("debug"):
                 logger.info("DEBUG - Decoding predictions")
             predictions = [
                 gen_text.strip() for gen_text in processor.batch_decode(generated_ids, skip_special_tokens=True)
             ]
 
-            if config["do_extra_eval"]:
-                if config["debug"]:
+            if config.get("do_extra_eval"):
+                if config.get("debug"):
                     logger.info("DEBUG - Extending prediction & reference lists")
                 all_predictions.extend(predictions)
                 all_references.extend(answers)
 
             # Print the predictions of the first batch only
-            if config["print_first_batch_predictions"] and val_idx == 0:
-                if config["debug"]:
+            if config.get("print_first_batch_predictions") and val_idx == 0:
+                if config.get("debug"):
                     logger.info("DEBUG - Printing first batch")
                 for task, prediction, answer in zip(tasks, predictions, answers):
                     print("\n----")
@@ -623,7 +625,7 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
 
     wandb_data = {"validation/avg_loss": eval_window_loss_sum / eval_window_token_count}
 
-    if config["do_extra_eval"]:
+    if config.get("do_extra_eval"):
         logger.info("Loading extra evaluation metrics")
         google_bleu_metric = evaluate.load("google_bleu")
         meteor_metric = evaluate.load("meteor")
@@ -688,32 +690,32 @@ def main():
     output_base_dir = Path(f"./checkpoints/{config['run_name']}")
     output_base_dir.mkdir(parents=True, exist_ok=True)
 
-    logger_setup(config["run_name"], output_base_dir)
+    logger_setup(config.get("run_name"), output_base_dir)
     logger.info(str(config))
-    if config["debug"]:
+    if config.get("debug"):
         logger.info("DEBUG - Debug mode enabled")
 
-    model_dtype = torch.bfloat16 if config["use_bf16"] else torch.float16
-    processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
+    model_dtype = torch.bfloat16 if config.get("use_bf16") else torch.float16
+    processor = AutoProcessor.from_pretrained(config.get("model_name"), trust_remote_code=True)
 
-    random.seed(config["seed"])
-    torch.manual_seed(config["seed"])
+    random.seed(config.get("seed"))
+    torch.manual_seed(config.get("seed"))
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config["seed"])
+        torch.cuda.manual_seed_all(config.get("seed"))
 
     # Gather and filter data
     logger.info("Gathering files from multiple datasets...")
-    all_pairs = get_all_files_by_prompt(config["dataset_config"])
+    all_pairs = get_all_files_by_prompt(config.get("dataset_config"))
 
     processes_count = int(
-        (config["dataloader_workers"] or os.cpu_count()) * config["filtering_processes_per_thread"]
+        (config.get("dataloader_workers") or os.cpu_count()) * config.get("filtering_processes_per_thread")
     )
 
     logger.info(
         f"Filtering data based on token length using {processes_count} processes "
         f"and batch size {int(config['filtering_batch_size'])}"
     )
-    filtered_pairs = filter_all_pairs(all_pairs, processor, processes_count, int(config["filtering_batch_size"]))
+    filtered_pairs = filter_all_pairs(all_pairs, processor, processes_count, int(config.get("filtering_batch_size")))
     logger.info(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
 
     del all_pairs
@@ -721,8 +723,8 @@ def main():
     logger.info("Shuffling and splitting train/eval splits")
     random.shuffle(filtered_pairs)
     eval_size = (
-        int(len(filtered_pairs) * config["eval_split"]) if config["eval_split"] < 1
-        else min(int(config["eval_split"]), len(filtered_pairs))
+        int(len(filtered_pairs) * config.get("eval_split")) if config.get("eval_split") < 1
+        else min(int(config.get("eval_split")), len(filtered_pairs))
     )
     eval_dataset_pairs = filtered_pairs[:eval_size]
     train_dataset_pairs = filtered_pairs[eval_size:]
@@ -751,41 +753,41 @@ def main():
     logger.info("Loading dataloaders")
     train_loader = DataLoader(
         train_dataset,
-        batch_size=int(config["train_batch_size"]),
+        batch_size=int(config.get("train_batch_size")),
         collate_fn=partial(collate_fn, processor=processor),
         shuffle=True,
-        num_workers=int(config["dataloader_workers"]) or os.cpu_count(),
-        persistent_workers=config["persistent_workers"],
+        num_workers=int(config.get("dataloader_workers")) or os.cpu_count(),
+        persistent_workers=config.get("persistent_workers"),
         pin_memory=True,
-        prefetch_factor=int(config["dataloader_prefetch_factor"]),
+        prefetch_factor=int(config.get("dataloader_prefetch_factor")),
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=int(config["eval_batch_size"]),
+        batch_size=int(config.get("eval_batch_size")),
         collate_fn=partial(collate_fn, processor=processor),
-        num_workers=int(config["dataloader_workers"]) or os.cpu_count(),
-        persistent_workers=config["persistent_workers"],
+        num_workers=int(config.get("dataloader_workers")) or os.cpu_count(),
+        persistent_workers=config.get("persistent_workers"),
         pin_memory=True,
-        prefetch_factor=int(config["dataloader_prefetch_factor"]),
+        prefetch_factor=int(config.get("dataloader_prefetch_factor")),
     )
 
     del train_dataset, val_dataset
 
     logger.info("Loading model")
     model = AutoModelForCausalLM.from_pretrained(
-        config["model_name"],
+        config.get("model_name"),
         torch_dtype=model_dtype,
         trust_remote_code=True,
-        attn_implementation=config["attn_implementation"],
+        attn_implementation=config.get("attn_implementation"),
     )
 
-    if config["freeze_language"]:
+    if config.get("freeze_language"):
         for param in model.language_model.parameters():
             param.requires_grad = False
-    if config["freeze_vision"]:
+    if config.get("freeze_vision"):
         for param in model.vision_tower.parameters():
             param.requires_grad = False
-    if config["freeze_other"]:
+    if config.get("freeze_other"):
         model.image_pos_embed.column_embeddings.weight.requires_grad = False
         model.image_pos_embed.row_embeddings.weight.requires_grad = False
         model.visual_temporal_embed.pos_idx_to_embed.requires_grad = False
@@ -793,37 +795,39 @@ def main():
         model.image_proj_norm.weight.requires_grad = False
         model.image_projection.requires_grad = False
 
-    if config["gradient_checkpointing"]:
+    if config.get("gradient_checkpointing"):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
 
     logger.info(f"Moving model to {device}")
     model.to(device)
 
     # Calculate total training steps
-    total_training_steps = math.ceil(len(train_loader) / config["gradient_accumulation_steps"]) * config["epochs"]
-    if len(train_loader) % config["gradient_accumulation_steps"] != 0:
+    total_training_steps = math.ceil(
+        len(train_loader) / config.get("gradient_accumulation_steps")
+    ) * config.get("epochs")
+    if len(train_loader) % config.get("gradient_accumulation_steps") != 0:
         total_training_steps += 1
 
     optimizer = prepare_optimizer(
         model.parameters(),
-        config["optimizer"],
-        config["learning_rate"],
-        config["weight_decay"]
+        config.get("optimizer"),
+        config.get("learning_rate"),
+        config.get("weight_decay")
     )
 
     scheduler = prepare_lr_scheduler(
         optimizer,
-        config["lr_scheduler"],
-        config["learning_rate"],
-        config["min_learning_rate"],
-        config["warmup_steps"],
+        config.get("lr_scheduler"),
+        config.get("learning_rate"),
+        config.get("min_learning_rate") or 0,
+        config.get("warmup_steps"),
         total_training_steps
     )
 
     # Train the model
     with wandb.init(
-        project=config["wandb_project_name"],
-        name=config["run_name"],
+        project=config.get("wandb_project_name"),
+        name=config.get("run_name"),
         save_code=True,
         settings=wandb.Settings(x_stats_sampling_interval=1),
     ) as run:
