@@ -435,6 +435,9 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
 def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_loader, processor, config, run):
     logger.info("Starting training")
 
+    total_training_steps = (
+        math.ceil(len(train_loader) / config.get("gradient_accumulation_steps")) * config.get("epochs")
+    )
     train_steps = 0
     window_loss_sum = 0.0
     window_token_count = 0
@@ -502,7 +505,7 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                     {
                         "epoch": train_steps / (total_training_steps / config.get("epochs")),
                         "loss": window_loss_sum / window_token_count,
-                        "grad_norm": grad_norm.item() / window_token_count
+                        "grad_norm": grad_norm.item() / window_token_count,
                     }
                 )
 
@@ -511,7 +514,7 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                         "train/loss": window_loss_sum / window_token_count,
                         "train/grad_norm": grad_norm.item() / window_token_count,
                         "train/lr": optimizer.param_groups[0]["lr"],
-                        "train/epoch": train_steps / (total_training_steps / config.get("epochs"))
+                        "train/epoch": train_steps / (total_training_steps / config.get("epochs")),
                     }
                 )
 
@@ -524,7 +527,7 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                         processor,
                         config.get("run_name"),
                         train_steps,
-                        config.get("save_total_limit")
+                        config.get("save_total_limit"),
                     )
 
                 if train_steps % config.get("eval_steps") == 0:
@@ -801,12 +804,6 @@ def main():
     logger.info(f"Moving model to {device}")
     model.to(device)
 
-    # Calculate total training steps
-    total_training_steps = math.ceil(
-        len(train_loader) / config.get("gradient_accumulation_steps")
-    ) * config.get("epochs")
-    if len(train_loader) % config.get("gradient_accumulation_steps") != 0:
-        total_training_steps += 1
 
     optimizer = prepare_optimizer(
         model.parameters(),
@@ -821,7 +818,7 @@ def main():
         config.get("learning_rate"),
         config.get("min_learning_rate") or 0,
         config.get("warmup_steps"),
-        total_training_steps
+        math.ceil(len(train_loader) / config.get("gradient_accumulation_steps")) * config.get("epochs"),
     )
 
     # Train the model
