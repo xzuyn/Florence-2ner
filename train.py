@@ -395,16 +395,14 @@ def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
         torch.cuda.empty_cache()
         gc.collect()
 
-    outputs = model(
+    # https://unsloth.ai/blog/gradient
+    batch_token_count = attention_mask.sum()
+    loss_sum = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
         labels=labels,
         attention_mask=attention_mask,
-    )
-
-    # https://unsloth.ai/blog/gradient
-    batch_token_count = attention_mask.sum()
-    loss_sum = outputs.loss * batch_token_count
+    ).loss.mul_(batch_token_count)
 
     return loss_sum.detach().item(), batch_token_count.item()
 
@@ -416,16 +414,14 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
         torch.cuda.empty_cache()
         gc.collect()
 
-    outputs = model(
+    # https://unsloth.ai/blog/gradient
+    batch_token_count = attention_mask.sum()
+    loss_sum = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
         labels=labels,
         attention_mask=attention_mask,
-    )
-
-    # https://unsloth.ai/blog/gradient
-    batch_token_count = attention_mask.sum()
-    loss_sum = outputs.loss * batch_token_count
+    ).loss.mul_(batch_token_count)
 
     loss_sum.backward()
 
