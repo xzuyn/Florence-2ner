@@ -29,23 +29,25 @@ from torch.optim.lr_scheduler import (
 )
 
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler("florence_log.log"),
-        logging.StreamHandler()
-    ],
-    force=True,
-)
-logger = logging.getLogger()
-logger.info("NEW RUN STARTED")
-
 # Allow extremely large images
 Image.MAX_IMAGE_PIXELS = None
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def logger_setup(run_name, file_location):
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        level=logging.INFO,
+        handlers=[
+            logging.FileHandler(f"{file_location}/{run_name}.log"),
+            logging.StreamHandler()
+        ],
+        force=True,
+    )
+    logger = logging.getLogger()
+    logger.info(run_name)
 
 
 # https://github.com/IvanVassi/REX_LR
@@ -398,13 +400,13 @@ def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
         attention_mask=attention_mask,
     )
 
+    # https://unsloth.ai/blog/gradient
     batch_token_count = attention_mask.sum()
     loss_sum = outputs.loss * batch_token_count
 
     return loss_sum.detach().item(), batch_token_count.item()
 
 
-# https://unsloth.ai/blog/gradient
 def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
     if do_gc:
         logger.info("Running garbage collection")
@@ -419,6 +421,7 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
         attention_mask=attention_mask,
     )
 
+    # https://unsloth.ai/blog/gradient
     batch_token_count = attention_mask.sum()
     loss_sum = outputs.loss * batch_token_count
 
@@ -427,36 +430,15 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
     return loss_sum.detach().item(), batch_token_count.item()
 
 
-def train_model(train_loader, val_loader, model, model_dtype, processor, config, run):
+def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_loader, processor, config, run):
     logger.info("Starting training")
-
-    # Calculate total training steps
-    total_training_steps = math.ceil(len(train_loader) / config["gradient_accumulation_steps"]) * config["epochs"]
-    if len(train_loader) % config["gradient_accumulation_steps"] != 0:
-        total_training_steps += 1
-
-    optimizer = prepare_optimizer(
-        model.parameters(),
-        config["optimizer"],
-        config["learning_rate"],
-        config["weight_decay"]
-    )
-
-    scheduler = prepare_lr_scheduler(
-        optimizer,
-        config["lr_scheduler"],
-        config["learning_rate"],
-        config["min_learning_rate"],
-        config["warmup_steps"],
-        total_training_steps
-    )
 
     train_steps = 0
     window_loss_sum = 0.0
     window_token_count = 0
 
     # Evaluate before any training starts
-    evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+    evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps)
 
     logger.info("Setting model to train mode")
     model.train()
@@ -490,7 +472,7 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
                 labels=labels,
-                attention_mask=(labels != processor.tokenizer.pad_token_id),
+                attention_mask=(labels != processor.tokenizer.pad_token_id),  # type: ignore[attr-defined]
                 do_gc=config["do_gc"],
             )
             window_loss_sum += loss_sum
@@ -544,19 +526,19 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
                     )
 
                 if train_steps % config["eval_steps"] == 0:
-                    evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+                    evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps)
                     logger.info("Setting model to train mode")
                     model.train()
 
     # Eval the last step if it hasn't been already
     if train_steps % config["eval_steps"] != 0:
-        evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+        evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps)
         logger.info("Setting model to train mode")
         model.train()
 
 
 @torch.inference_mode()
-def evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps):
+def evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps):
     logger.info("Starting evaluation")
 
     logger.info("Running garbage collection")
@@ -597,7 +579,7 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
             input_ids=inputs["input_ids"],
             pixel_values=inputs["pixel_values"],
             labels=labels,
-            attention_mask=(labels != processor.tokenizer.pad_token_id),
+            attention_mask=(labels != processor.tokenizer.pad_token_id),  # type: ignore[attr-defined]
             do_gc=config["do_gc"],
         )
         eval_window_loss_sum += eval_loss_sum
@@ -701,13 +683,15 @@ def main():
     with open(args.yaml_file, "r") as f:
         # TODO: Set default config values if setting is not present
         config = yaml.safe_load(f)
-        logger.info(str(config))
-        if config["debug"]:
-            logger.info("DEBUG - Debug mode enabled")
 
     # Prepare output directory
     output_base_dir = Path(f"./checkpoints/{config['run_name']}")
     output_base_dir.mkdir(parents=True, exist_ok=True)
+
+    logger_setup(config["run_name"], output_base_dir)
+    logger.info(str(config))
+    if config["debug"]:
+        logger.info("DEBUG - Debug mode enabled")
 
     model_dtype = torch.bfloat16 if config["use_bf16"] else torch.float16
     processor = AutoProcessor.from_pretrained(config["model_name"], trust_remote_code=True)
@@ -734,7 +718,7 @@ def main():
 
     del all_pairs
 
-    logger.info("Shuffing and splitting train/eval splits")
+    logger.info("Shuffling and splitting train/eval splits")
     random.shuffle(filtered_pairs)
     eval_size = (
         int(len(filtered_pairs) * config["eval_split"]) if config["eval_split"] < 1
@@ -815,6 +799,27 @@ def main():
     logger.info(f"Moving model to {device}")
     model.to(device)
 
+    # Calculate total training steps
+    total_training_steps = math.ceil(len(train_loader) / config["gradient_accumulation_steps"]) * config["epochs"]
+    if len(train_loader) % config["gradient_accumulation_steps"] != 0:
+        total_training_steps += 1
+
+    optimizer = prepare_optimizer(
+        model.parameters(),
+        config["optimizer"],
+        config["learning_rate"],
+        config["weight_decay"]
+    )
+
+    scheduler = prepare_lr_scheduler(
+        optimizer,
+        config["lr_scheduler"],
+        config["learning_rate"],
+        config["min_learning_rate"],
+        config["warmup_steps"],
+        total_training_steps
+    )
+
     # Train the model
     with wandb.init(
         project=config["wandb_project_name"],
@@ -824,7 +829,7 @@ def main():
     ) as run:
         wandb.save(args.yaml_file)
 
-        train_model(train_loader, val_loader, model, model_dtype, processor, config, run)
+        train_model(model, model_dtype, optimizer, scheduler, train_loader, val_loader, processor, config, run)
 
 
 if __name__ == "__main__":
