@@ -338,6 +338,11 @@ def prepare_lr_scheduler(
 def save_model_checkpoint(model, processor, run_name, train_steps, save_total_limit):
     logger.info("Saving checkpoint")
 
+    logger.info("Running garbage collection")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
+
     output_dir = f"./checkpoints/{run_name}/step-{train_steps}"
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir)
@@ -363,6 +368,7 @@ def save_model_checkpoint(model, processor, run_name, train_steps, save_total_li
 @torch.inference_mode()
 def run_generate(model, input_ids, pixel_values, do_gc):
     if do_gc:
+        logger.info("Running garbage collection")
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         gc.collect()
@@ -380,6 +386,7 @@ def run_generate(model, input_ids, pixel_values, do_gc):
 @torch.inference_mode()
 def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
     if do_gc:
+        logger.info("Running garbage collection")
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         gc.collect()
@@ -392,21 +399,27 @@ def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
     ).loss.item()
 
 
-def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, grad_acc_steps, do_gc):
+# https://unsloth.ai/blog/gradient
+def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
     if do_gc:
+        logger.info("Running garbage collection")
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         gc.collect()
 
-    loss = model(
+    outputs = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
         labels=labels,
         attention_mask=attention_mask,
-    ).loss / grad_acc_steps
-    loss.backward()
+    )
 
-    return loss
+    batch_token_count = attention_mask.sum()
+    loss_sum = outputs.loss * batch_token_count
+
+    loss_sum.backward()
+
+    return loss_sum.detach().item(), batch_token_count.item()
 
 
 def train_model(train_loader, val_loader, model, model_dtype, processor, config, run):
@@ -434,6 +447,8 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
     )
 
     train_steps = 0
+    window_loss_sum = 0.0
+    window_token_count = 0
 
     # Evaluate before any training starts
     evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
@@ -446,6 +461,8 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
     progress_bar = tqdm(range(total_training_steps), desc="Training")
     for epoch in range(config["epochs"]):
         for i, (_, inputs, answers) in enumerate(train_loader):
+            if config["debug"]:
+                logger.info("DEBUG - Creating labels")
             labels = processor.tokenizer(
                 text=answers,
                 return_tensors="pt",
@@ -455,38 +472,52 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
                 return_token_type_ids=False,
             ).input_ids.to(device)
 
-            # Create attention mask to ignore padding tokens
-            attention_mask = labels != processor.tokenizer.pad_token_id
-
             # Move inputs to device and cast pixel_values to bf16 or fp16
+            if config["debug"]:
+                logger.info("DEBUG - Moving inputs")
             inputs = inputs.to(device)
             inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
 
-            loss = run_forward_backward(
+            if config["debug"]:
+                logger.info("DEBUG - Running forward & backward")
+            loss_sum, token_count = run_forward_backward(
                 model=model,
                 input_ids=inputs["input_ids"],
                 pixel_values=inputs["pixel_values"],
                 labels=labels,
-                attention_mask=attention_mask,
-                grad_acc_steps=config["gradient_accumulation_steps"],
+                attention_mask=(labels != processor.tokenizer.pad_token_id),
                 do_gc=config["do_gc"],
             )
+            window_loss_sum += loss_sum
+            window_token_count += token_count
 
-            del inputs, answers, labels, attention_mask
+            del inputs, answers, labels
 
             if (i + 1) % config["gradient_accumulation_steps"] == 0 or (i + 1) == len(train_loader):
+                if config["debug"]:
+                    logger.info("DEBUG - Clipping grad_norm")
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad /= window_token_count
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config["clip_grad_norm"])
 
+                if config["debug"]:
+                    logger.info("DEBUG - Stepping optimizer & scheduler")
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-                scalar_loss = loss.detach().item() * config["gradient_accumulation_steps"]
+                if config["debug"]:
+                    logger.info("DEBUG - Creating scalar_loss")
+                scalar_loss = window_loss_sum / window_token_count
+                window_loss_sum = 0.0
+                window_token_count = 0
 
                 train_steps += 1
                 progress_bar.update(1)
                 progress_bar.set_postfix(
                     {
+                        "epoch": train_steps / (total_training_steps / config["epochs"]),
                         "loss": scalar_loss,
                         "grad_norm": grad_norm.item()
                     }
@@ -501,10 +532,7 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
                     }
                 )
 
-                del loss, scalar_loss, grad_norm
-
-                if train_steps % config["eval_steps"] == 0:
-                    evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+                del loss_sum, scalar_loss, grad_norm
 
                 if train_steps % config["save_steps"] == 0:
                     save_model_checkpoint(
@@ -515,18 +543,26 @@ def train_model(train_loader, val_loader, model, model_dtype, processor, config,
                         config["save_total_limit"]
                     )
 
-        # Save on epoch if it hasn't been already
-        if train_steps % config["save_steps"] != 0:
-            save_model_checkpoint(model, processor, config["run_name"], train_steps, config["save_total_limit"])
+                if train_steps % config["eval_steps"] == 0:
+                    evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+                    logger.info("Setting model to train mode")
+                    model.train()
 
     # Eval the last step if it hasn't been already
     if train_steps % config["eval_steps"] != 0:
         evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps)
+        logger.info("Setting model to train mode")
+        model.train()
 
 
 @torch.inference_mode()
 def evaluate_model(val_loader, model, model_dtype, processor, config, run, train_steps):
     logger.info("Starting evaluation")
+
+    logger.info("Running garbage collection")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
 
     all_references = []
     all_predictions = []
@@ -537,6 +573,8 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
 
     eval_progress_bar = tqdm(range(len(val_loader)), desc="Validating")
     for val_idx, (tasks, inputs, answers) in enumerate(val_loader):
+        if config["debug"]:
+            logger.info("DEBUG - Creating labels")
         labels = processor.tokenizer(
             text=answers,
             return_tensors="pt",
@@ -545,23 +583,26 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
             truncation=False,
         ).input_ids.to(device)
 
-        # Create attention mask for padding tokens
-        attention_mask = labels != processor.tokenizer.pad_token_id
-
         # Move inputs to device and cast pixel_values to bf16 or fp16
+        if config["debug"]:
+            logger.info("DEBUG - Moving inputs")
         inputs = inputs.to(device)
         inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
 
+        if config["debug"]:
+            logger.info("DEBUG - Running forward")
         total_eval_loss += run_forward(
             model=model,
             input_ids=inputs["input_ids"],
             pixel_values=inputs["pixel_values"],
             labels=labels,
-            attention_mask=attention_mask,
+            attention_mask=(labels != processor.tokenizer.pad_token_id),
             do_gc=config["do_gc"],
         )
 
         if config["do_extra_eval"] or (config["print_first_batch_predictions"] and val_idx == 0):
+            if config["debug"]:
+                logger.info("DEBUG - Running generate")
             generated_ids = run_generate(
                 model=model,
                 input_ids=inputs["input_ids"],
@@ -569,16 +610,22 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
                 do_gc=config["do_gc"],
             )
 
+            if config["debug"]:
+                logger.info("DEBUG - Decoding predictions")
             predictions = [
                 gen_text.strip() for gen_text in processor.batch_decode(generated_ids, skip_special_tokens=True)
             ]
 
             if config["do_extra_eval"]:
+                if config["debug"]:
+                    logger.info("DEBUG - Extending prediction & reference lists")
                 all_predictions.extend(predictions)
                 all_references.extend(answers)
 
             # Print the predictions of the first batch only
             if config["print_first_batch_predictions"] and val_idx == 0:
+                if config["debug"]:
+                    logger.info("DEBUG - Printing first batch")
                 for task, prediction, answer in zip(tasks, predictions, answers):
                     print("\n----")
                     print("        Task:", task)
@@ -630,8 +677,10 @@ def evaluate_model(val_loader, model, model_dtype, processor, config, run, train
     logger.info("Logging evaluation metrics to W&B")
     run.log(wandb_data, step=train_steps)
 
-    logger.info("Setting model to train mode")
-    model.train()
+    logger.info("Running garbage collection")
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
 def main():
@@ -651,6 +700,8 @@ def main():
         # TODO: Set default config values if setting is not present
         config = yaml.safe_load(f)
         logger.info(str(config))
+        if config["debug"]:
+            logger.info("DEBUG - Debug mode enabled")
 
     # Prepare output directory
     output_base_dir = Path(f"./checkpoints/{config['run_name']}")
@@ -705,7 +756,8 @@ def main():
     del eval_list_file
 
     train_dataset = LocalImageTextDataset(train_dataset_pairs)
-    # TODO: Add ability to specify a val set
+    # TODO: Add ability to specify an eval set
+    # TODO: Make eval optional
     val_dataset = LocalImageTextDataset(eval_dataset_pairs)
 
     del train_dataset_pairs, eval_dataset_pairs
@@ -762,7 +814,12 @@ def main():
     model.to(device)
 
     # Train the model
-    with wandb.init(project=config["wandb_project_name"], name=config["run_name"]) as run:
+    with wandb.init(
+        project=config["wandb_project_name"],
+        name=config["run_name"],
+        save_code=True,
+        settings=wandb.Settings(x_stats_sampling_interval=1),
+    ) as run:
         wandb.save(args.yaml_file)
 
         train_model(train_loader, val_loader, model, model_dtype, processor, config, run)
