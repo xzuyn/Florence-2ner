@@ -1,6 +1,7 @@
 # Project Settings
 wandb_project_name: Florence-2-base
 run_name: Florence-2-base-Example-v0.1-run1
+wandb_x_stats_sampling_interval: 1
 
 # Model Settings
 model_name: microsoft/Florence-2-base
@@ -11,8 +12,8 @@ use_bf16: true
 save_steps: 10
 eval_steps: 10
 save_total_limit: 3
-save_on_epoch_too: true
 do_extra_eval: true
+eval_before_training: true
 print_first_batch_predictions: true
 
 # Hyperparameter Settings
@@ -52,3 +53,6 @@ filtering_batch_size: 16
 dataloader_workers: 12
 persistent_workers: true
 dataloader_prefetch_factor: 2
+
+# Debug
+debug: false
