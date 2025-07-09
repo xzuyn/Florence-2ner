@@ -439,7 +439,8 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
     window_token_count = 0
 
     # Evaluate before any training starts
-    evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps)
+    if config.get("eval_before_training"):
+        evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps)
 
     logger.info("Setting model to train mode")
     model.train()
@@ -530,6 +531,16 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                     evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps)
                     logger.info("Setting model to train mode")
                     model.train()
+
+    # Save the last step if it hasn't been already
+    if train_steps % config.get("save_steps") != 0:
+        save_model_checkpoint(
+            model,
+            processor,
+            config.get("run_name"),
+            train_steps,
+            config.get("save_total_limit"),
+        )
 
     # Eval the last step if it hasn't been already
     if train_steps % config.get("eval_steps") != 0:
@@ -822,9 +833,9 @@ def main():
         project=config.get("wandb_project_name"),
         name=config.get("run_name"),
         save_code=True,
-        settings=wandb.Settings(x_stats_sampling_interval=1),
+        settings=wandb.Settings(x_stats_sampling_interval=config.get("wandb_x_stats_sampling_interval")),
     ) as run:
-        wandb.save(args.yaml_file)
+        wandb.save(output_base_dir / Path(args.yaml_file).name)
 
         train_model(model, model_dtype, optimizer, scheduler, train_loader, val_loader, processor, config, run)
 
