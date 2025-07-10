@@ -198,7 +198,7 @@ def filter_data_chunk(chunk, processor):
     filtered = []
     for (task_prompt, img_path, txt_path), ids in zip(meta, tokenized.input_ids):
         length = len(ids)
-        if length <= 1000:  # TODO: Properly calculate (1024 - task prompt token count)
+        if length <= (processor.tokenizer.model_max_length - 24):  # TODO: Properly calculate (1024 - task prompt token count)
             filtered.append((task_prompt, img_path, txt_path))
         else:
             logger.warning(f"Caption too long ({length} tokens): {img_path}")
@@ -485,9 +485,12 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
             if (i + 1) % config.get("gradient_accumulation_steps") == 0 or (i + 1) == len(train_loader):
                 if config.get("debug"):
                     logger.info("DEBUG - Clipping grad_norm")
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.div_(window_token_count)
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(),
-                    config.get("clip_grad_norm") * window_token_count
+                    config.get("clip_grad_norm"),
                 )
 
                 if config.get("debug"):
@@ -502,14 +505,14 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                     {
                         "epoch": train_steps / (total_training_steps / config.get("epochs")),
                         "loss": window_loss_sum / window_token_count,
-                        "grad_norm": grad_norm.item() / window_token_count,
+                        "grad_norm": grad_norm.item(),
                     }
                 )
 
                 run.log(
                     {
                         "train/loss": window_loss_sum / window_token_count,
-                        "train/grad_norm": grad_norm.item() / window_token_count,
+                        "train/grad_norm": grad_norm.item(),
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/epoch": train_steps / (total_training_steps / config.get("epochs")),
                     }
@@ -706,7 +709,7 @@ def main():
         logger.info("DEBUG - Debug mode enabled")
 
     model_dtype = torch.bfloat16 if config.get("use_bf16") else torch.float16
-    processor = AutoProcessor.from_pretrained(config.get("model_name"), trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(config.get("model_name"), trust_remote_code=True, padding_side="left")
 
     random.seed(config.get("seed"))
     torch.manual_seed(config.get("seed"))
