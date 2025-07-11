@@ -31,7 +31,7 @@ clip_grad_norm: 0.5
 weight_decay: 0.01
 seed: 42
 garbage_collection: false
-activation_offloading:  # cpu or disk
+activation_offloading:  # cpu or disk or partial_cpu or partial_disk
 
 # Freezing Settings
 freeze_vision: false
