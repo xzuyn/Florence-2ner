@@ -30,7 +30,8 @@ warmup_steps: 20
 clip_grad_norm: 0.5
 weight_decay: 0.01
 seed: 42
-do_gc: false
+garbage_collection: false
+cpu_offload_activations: false
 
 # Freezing Settings
 freeze_vision: false
