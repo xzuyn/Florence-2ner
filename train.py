@@ -7,6 +7,7 @@ import json
 import yaml
 import torch
 import shutil
+import psutil
 import random
 import logging
 import argparse
@@ -18,15 +19,6 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 from functools import partial
-
-from torch.utils.data import DataLoader, Dataset
-from torch.optim.lr_scheduler import (
-    ConstantLR,
-    CosineAnnealingLR,
-    LinearLR,
-    SequentialLR,
-    LRScheduler
-)
 
 
 # Allow extremely large images
@@ -53,7 +45,7 @@ def logger_setup(run_name, file_location):
 
 
 # https://github.com/IvanVassi/REX_LR
-class RexLR(LRScheduler):
+class RexLR(torch.optim.lr_scheduler.LRScheduler):
     """
     Reflected Exponential (REX) learning rate scheduler.
 
@@ -124,7 +116,7 @@ class RexLR(LRScheduler):
         return [base_lr * rex_factor for base_lr in self.base_lrs]
 
 
-class LocalImageTextDataset(Dataset):
+class LocalImageTextDataset(torch.utils.data.Dataset):
     def __init__(self, data_pairs):
         # data_pairs: list of tuples (task_prompt, image_path, text_path)
         self.data_pairs = data_pairs
@@ -298,11 +290,11 @@ def prepare_lr_scheduler(
     logger.info("Preparing lr_scheduler")
 
     if scheduler_name == "Constant":
-        main_scheduler = ConstantLR(
+        main_scheduler = torch.optim.lr_scheduler.ConstantLR(
             scheduler_optimizer
         )
     elif scheduler_name == "Cosine":
-        main_scheduler = CosineAnnealingLR(
+        main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             scheduler_optimizer,
             T_max=(scheduler_total_training_steps - scheduler_warmup_steps) + 1
         )
@@ -316,19 +308,19 @@ def prepare_lr_scheduler(
         )
     else:
         logger.warning("No valid LR scheduler selected. Falling back to Cosine.")
-        main_scheduler = CosineAnnealingLR(
+        main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             scheduler_optimizer,
             T_max=(scheduler_total_training_steps - scheduler_warmup_steps) + 1
         )
 
     if scheduler_warmup_steps > 0 and scheduler_name != "REX":
-        warmup_scheduler = LinearLR(
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             scheduler_optimizer,
             start_factor=1e-20,
             end_factor=1.0,
             total_iters=scheduler_warmup_steps
         )
-        scheduler = SequentialLR(
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
             scheduler_optimizer,
             schedulers=[warmup_scheduler, main_scheduler],
             milestones=[scheduler_warmup_steps]
@@ -342,7 +334,8 @@ def prepare_lr_scheduler(
 def save_model_checkpoint(model, processor, run_name, train_steps, save_total_limit):
     logger.info("Saving checkpoint")
 
-    logger.info("Running garbage collection")
+    if config.get("debug"):
+        logger.info("Running garbage collection")
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
@@ -390,7 +383,6 @@ def run_generate(model, input_ids, pixel_values, do_gc):
 @torch.inference_mode()
 def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
     if do_gc:
-        logger.info("Running garbage collection")
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         gc.collect()
@@ -407,21 +399,39 @@ def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
     return loss_sum.detach().item(), batch_token_count.item()
 
 
-def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
+def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, do_gc, do_ao):
     if do_gc:
-        logger.info("Running garbage collection")
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         gc.collect()
 
     # https://unsloth.ai/blog/gradient
     batch_token_count = attention_mask.sum()
-    loss_sum = model(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        labels=labels,
-        attention_mask=attention_mask,
-    ).loss.mul_(batch_token_count)
+
+    if do_ao:
+        def pack(tensor):
+            if psutil.virtual_memory().percent > 85:
+                return tensor
+            else:
+                return tensor.cpu()
+
+        def unpack(tensor):
+            return tensor.to(input_ids.device)
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            loss_sum = model(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                labels=labels,
+                attention_mask=attention_mask,
+            ).loss.mul_(batch_token_count)
+    else:
+        loss_sum = model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            labels=labels,
+            attention_mask=attention_mask,
+        ).loss.mul_(batch_token_count)
 
     loss_sum.backward()
 
@@ -475,7 +485,8 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                 pixel_values=inputs["pixel_values"],
                 labels=labels,
                 attention_mask=(labels != processor.tokenizer.pad_token_id),  # type: ignore[attr-defined]
-                do_gc=config.get("do_gc"),
+                do_gc=config.get("garbage_collection"),
+                do_ao=config.get("cpu_offload_activations"),
             )
             window_loss_sum += loss_sum
             window_token_count += token_count
@@ -488,10 +499,7 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                 for p in model.parameters():
                     if p.grad is not None:
                         p.grad.div_(window_token_count)
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    config.get("clip_grad_norm"),
-                )
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.get("clip_grad_norm"))
 
                 if config.get("debug"):
                     logger.info("DEBUG - Stepping optimizer & scheduler")
@@ -556,7 +564,8 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
 def evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps):
     logger.info("Starting evaluation")
 
-    logger.info("Running garbage collection")
+    if config.get("debug"):
+        logger.info("Running garbage collection")
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
@@ -676,7 +685,8 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
     logger.info("Logging evaluation metrics to W&B")
     run.log(wandb_data, step=train_steps)
 
-    logger.info("Running garbage collection")
+    if config.get("debug"):
+        logger.info("Running garbage collection")
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
@@ -764,7 +774,7 @@ def main():
     del train_dataset_pairs, eval_dataset_pairs
 
     logger.info("Loading dataloaders")
-    train_loader = DataLoader(
+    train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=int(config.get("train_batch_size")),
         collate_fn=partial(collate_fn, processor=processor),
@@ -774,7 +784,7 @@ def main():
         pin_memory=True,
         prefetch_factor=int(config.get("dataloader_prefetch_factor")),
     )
-    val_loader = DataLoader(
+    val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=int(config.get("eval_batch_size")),
         collate_fn=partial(collate_fn, processor=processor),
