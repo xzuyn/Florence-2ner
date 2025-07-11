@@ -202,7 +202,7 @@ def cpu_unpack(tensor):
 
 
 def partial_cpu_unpack(tensor):
-    if tensor.device == "cpu":
+    if tensor.get_device() == -1:
         global CURRENT_OFFLOADED_BYTES
         CURRENT_OFFLOADED_BYTES -= tensor.numel() * tensor.element_size()
     return tensor.to(device)
