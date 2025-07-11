@@ -30,7 +30,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 OFFLOAD_DIR = "./TEMP_ACTIVATIONS"
-OFFLOAD_THRESHOLD = 100 * (1024**2)  # 100MB  # TODO: Make adjustable
+# Activations above this size will be offloaded
+OFFLOAD_THRESHOLD = 64 * (1024**2)  # 64MB
+# Max size of activations allowed to be offloaded
+OFFLOAD_LIMIT_BYTES = 4096 * (1024**2)  # 4096MB
+CURRENT_OFFLOADED_BYTES = 0
 
 
 def logger_setup(run_name, file_location):
@@ -158,20 +162,18 @@ def gpu_pack(tensor):
     return tensor
 
 
-def gpu_unpack(tensor):
-    return tensor
-
-
 def cpu_pack(tensor):
     return tensor.cpu()
 
 
 def partial_cpu_pack(tensor):
-    return tensor.cpu() if (tensor.numel() * tensor.element_size()) > OFFLOAD_THRESHOLD else tensor
-
-
-def cpu_unpack(tensor):
-    return tensor.to(device)
+    global CURRENT_OFFLOADED_BYTES
+    tensor_bytes = tensor.numel() * tensor.element_size()
+    if (tensor_bytes >= OFFLOAD_THRESHOLD) and (CURRENT_OFFLOADED_BYTES + tensor_bytes <= OFFLOAD_LIMIT_BYTES):
+        CURRENT_OFFLOADED_BYTES += tensor_bytes
+        return tensor.cpu()
+    else:
+        return tensor
 
 
 def disk_pack(tensor):
@@ -180,12 +182,10 @@ def disk_pack(tensor):
     return temp_file
 
 
-def disk_unpack(temp_file_or_tensor):
-    return load_file(temp_file_or_tensor.name, device=device)["tensor"]
-
-
 def partial_disk_pack(tensor):
-    if (tensor.numel() * tensor.element_size()) > OFFLOAD_THRESHOLD:
+    global CURRENT_OFFLOADED_BYTES
+    tensor_bytes = tensor.numel() * tensor.element_size()
+    if (tensor_bytes >= OFFLOAD_THRESHOLD) and (CURRENT_OFFLOADED_BYTES + tensor_bytes <= OFFLOAD_LIMIT_BYTES):
         temp_file = SelfDeletingTempFile()
         save_file({"tensor": tensor if tensor.is_contiguous() else tensor.contiguous()}, temp_file.name)
         return temp_file
@@ -193,10 +193,31 @@ def partial_disk_pack(tensor):
         return tensor
 
 
+def gpu_unpack(tensor):
+    return tensor
+
+
+def cpu_unpack(tensor):
+    return tensor.to(device)
+
+
+def partial_cpu_unpack(tensor):
+    if tensor.device == "cpu":
+        global CURRENT_OFFLOADED_BYTES
+        CURRENT_OFFLOADED_BYTES -= tensor.numel() * tensor.element_size()
+    return tensor.to(device)
+
+
+def disk_unpack(temp_file):
+    return load_file(temp_file.name, device=device)["tensor"]
+
+
 def partial_disk_unpack(temp_file_or_tensor):
     if torch.is_tensor(temp_file_or_tensor):
         return temp_file_or_tensor
     else:
+        global CURRENT_OFFLOADED_BYTES
+        CURRENT_OFFLOADED_BYTES -= tensor.numel() * tensor.element_size()
         return load_file(temp_file_or_tensor.name, device=device)["tensor"]
 
 
@@ -242,15 +263,20 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
         torch.cuda.empty_cache()
         gc.collect()
 
-    if activation_offloading == "cpu":             # Offload all activations to CPU
+    # Offload all activations to CPU
+    if activation_offloading == "cpu":
         pack_choice, unpack_choice = cpu_pack, cpu_unpack
-    elif activation_offloading == "disk":          # Offload all activations to disk
+    # Offload all activations to disk
+    elif activation_offloading == "disk":
         pack_choice, unpack_choice = disk_pack, disk_unpack
-    elif activation_offloading == "partial_cpu":   # Offload activations above OFFLOAD_THRESHOLD MB to CPU
-        pack_choice, unpack_choice = partial_cpu_pack, cpu_unpack
-    elif activation_offloading == "partial_disk":  # Offload activations above OFFLOAD_THRESHOLD MB to disk
+    # Offload activations above OFFLOAD_THRESHOLD to CPU, up to a maximum of CURRENT_OFFLOADED_BYTES
+    elif activation_offloading == "partial_cpu":
+        pack_choice, unpack_choice = partial_cpu_pack, partial_cpu_unpack
+    # Offload activations above OFFLOAD_THRESHOLD to disk, up to a maximum of CURRENT_OFFLOADED_BYTES
+    elif activation_offloading == "partial_disk":
         pack_choice, unpack_choice = partial_disk_pack, partial_disk_unpack
-    else:                                          # Keep all activations on GPU/device
+    # Keep all activations on GPU
+    else:
         pack_choice, unpack_choice = gpu_pack, gpu_unpack
 
     with torch.autograd.graph.saved_tensors_hooks(pack_choice, unpack_choice):
@@ -461,8 +487,6 @@ def prepare_lr_scheduler(
 def save_model_checkpoint(model, processor, run_name, train_steps, save_total_limit):
     logger.info("Saving checkpoint")
 
-    if config.get("debug"):
-        logger.info("Running garbage collection")
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
@@ -511,8 +535,6 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
     progress_bar = tqdm(range(total_training_steps), desc="Training")
     for epoch in range(config.get("epochs")):
         for i, (_, inputs, answers) in enumerate(train_loader):
-            if config.get("debug"):
-                logger.info("DEBUG - Creating labels")
             labels = processor.tokenizer(
                 text=answers,
                 return_tensors="pt",
@@ -523,13 +545,9 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
             ).input_ids.to(device)
 
             # Move inputs to device and cast pixel_values to bf16 or fp16
-            if config.get("debug"):
-                logger.info("DEBUG - Moving inputs")
             inputs = inputs.to(device)
             inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
 
-            if config.get("debug"):
-                logger.info("DEBUG - Running forward & backward")
             loss_sum, token_count = run_forward_backward(
                 model=model,
                 input_ids=inputs["input_ids"],
@@ -545,15 +563,11 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
             del inputs, answers, labels
 
             if (i + 1) % config.get("gradient_accumulation_steps") == 0 or (i + 1) == len(train_loader):
-                if config.get("debug"):
-                    logger.info("DEBUG - Clipping grad_norm")
                 for p in model.parameters():
                     if p.grad is not None:
                         p.grad.div_(window_token_count)
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.get("clip_grad_norm"))
 
-                if config.get("debug"):
-                    logger.info("DEBUG - Stepping optimizer & scheduler")
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
@@ -615,8 +629,6 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
 def evaluate_model(model, model_dtype, val_loader, processor, config, run, train_steps):
     logger.info("Starting evaluation")
 
-    if config.get("debug"):
-        logger.info("Running garbage collection")
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
@@ -631,8 +643,6 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
 
     eval_progress_bar = tqdm(range(len(val_loader)), desc="Validating")
     for val_idx, (tasks, inputs, answers) in enumerate(val_loader):
-        if config.get("debug"):
-            logger.info("DEBUG - Creating labels")
         labels = processor.tokenizer(
             text=answers,
             return_tensors="pt",
@@ -642,13 +652,9 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
         ).input_ids.to(device)
 
         # Move inputs to device and cast pixel_values to bf16 or fp16
-        if config.get("debug"):
-            logger.info("DEBUG - Moving inputs")
         inputs = inputs.to(device)
         inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
 
-        if config.get("debug"):
-            logger.info("DEBUG - Running forward")
         eval_loss_sum, eval_token_count = run_forward(
             model=model,
             input_ids=inputs["input_ids"],
@@ -661,8 +667,6 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
         eval_window_token_count += eval_token_count
 
         if config.get("do_extra_eval") or (config.get("print_first_batch_predictions") and val_idx == 0):
-            if config.get("debug"):
-                logger.info("DEBUG - Running generate")
             generated_ids = run_generate(
                 model=model,
                 input_ids=inputs["input_ids"],
@@ -670,22 +674,16 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
                 do_gc=config.get("do_gc"),
             )
 
-            if config.get("debug"):
-                logger.info("DEBUG - Decoding predictions")
             predictions = [
                 gen_text.strip() for gen_text in processor.batch_decode(generated_ids, skip_special_tokens=True)
             ]
 
             if config.get("do_extra_eval"):
-                if config.get("debug"):
-                    logger.info("DEBUG - Extending prediction & reference lists")
                 all_predictions.extend(predictions)
                 all_references.extend(answers)
 
             # Print the predictions of the first batch only
             if config.get("print_first_batch_predictions") and val_idx == 0:
-                if config.get("debug"):
-                    logger.info("DEBUG - Printing first batch")
                 for task, prediction, answer in zip(tasks, predictions, answers):
                     print("\n----")
                     print("        Task:", task)
@@ -736,14 +734,14 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
     logger.info("Logging evaluation metrics to W&B")
     run.log(wandb_data, step=train_steps)
 
-    if config.get("debug"):
-        logger.info("Running garbage collection")
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     gc.collect()
 
 
 def main():
+    global OFFLOAD_THRESHOLD, OFFLOAD_LIMIT_BYTES
+
     parser = argparse.ArgumentParser(
         description="A simple Florence-2 finetuning script."
     )
@@ -766,11 +764,15 @@ def main():
 
     logger_setup(config.get("run_name"), output_base_dir)
     logger.info(str(config))
-    if config.get("debug"):
-        logger.info("DEBUG - Debug mode enabled")
 
     if config.get("activation_offloading") in ["disk", "partial_disk"]:
         os.makedirs(OFFLOAD_DIR, exist_ok=True)
+
+    if config.get("offload_threshold_mb"):
+        OFFLOAD_THRESHOLD = config.get("offload_threshold_mb") * (1024**2)
+
+    if config.get("offload_limit_mb"):
+        OFFLOAD_LIMIT_BYTES = config.get("offload_limit_mb") * (1024**2)
 
     model_dtype = torch.bfloat16 if config.get("use_bf16") else torch.float16
     processor = AutoProcessor.from_pretrained(config.get("model_name"), trust_remote_code=True, padding_side="left")
@@ -785,7 +787,7 @@ def main():
     all_pairs = get_all_files_by_prompt(config.get("dataset_config"))
 
     processes_count = int(
-        (config.get("dataloader_workers") or os.cpu_count()) * config.get("filtering_processes_per_thread")
+        os.cpu_count() * config.get("filtering_processes_per_thread")
     )
 
     logger.info(
