@@ -165,7 +165,7 @@ def cpu_pack(tensor):
 
 
 def cpu_unpack(tensor):
-    return tensor.to(input_ids.device)
+    return tensor.to(device)
 
 
 def disk_pack(tensor):
@@ -175,7 +175,7 @@ def disk_pack(tensor):
 
 
 def disk_unpack(temp_file):
-    return torch.load(temp_file.name, weights_only=True)
+    return torch.load(temp_file.name, map_location=device, weights_only=True)
 
 
 @torch.inference_mode()
