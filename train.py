@@ -20,6 +20,7 @@ from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
 from functools import partial
+from safetensors.torch import save_file, load_file
 
 
 # Allow extremely large images
@@ -28,7 +29,8 @@ Image.MAX_IMAGE_PIXELS = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-ACTIVATION_OFFLOAD_DIR = "./TEMP_ACTIVATIONS"
+OFFLOAD_DIR = "./TEMP_ACTIVATIONS"
+OFFLOAD_THRESHOLD = 100 * (1024**2)  # 100MB  # TODO: Make adjustable
 
 
 def logger_setup(run_name, file_location):
@@ -146,7 +148,7 @@ class LocalImageTextDataset(torch.utils.data.Dataset):
 
 class SelfDeletingTempFile:
     def __init__(self):
-        self.name = os.path.join(ACTIVATION_OFFLOAD_DIR, str(uuid.uuid4()))
+        self.name = os.path.join(OFFLOAD_DIR, f"{str(uuid.uuid4())}.safetensors")
 
     def __del__(self):
         os.remove(self.name)
@@ -161,7 +163,11 @@ def gpu_unpack(tensor):
 
 
 def cpu_pack(tensor):
-    return tensor.cpu()  # TODO: Add a "partial offload" option
+    return tensor.cpu()
+
+
+def partial_cpu_pack(tensor):
+    return tensor.cpu() if (tensor.numel() * tensor.element_size()) > OFFLOAD_THRESHOLD else tensor
 
 
 def cpu_unpack(tensor):
@@ -170,18 +176,33 @@ def cpu_unpack(tensor):
 
 def disk_pack(tensor):
     temp_file = SelfDeletingTempFile()
-    torch.save(tensor, temp_file.name)
+    save_file({"tensor": tensor if tensor.is_contiguous() else tensor.contiguous()}, temp_file.name)
     return temp_file
 
 
-def disk_unpack(temp_file):
-    return torch.load(temp_file.name, map_location=device, weights_only=True)
+def disk_unpack(temp_file_or_tensor):
+    return load_file(temp_file_or_tensor.name, device=device)["tensor"]
+
+
+def partial_disk_pack(tensor):
+    if (tensor.numel() * tensor.element_size()) > OFFLOAD_THRESHOLD:
+        temp_file = SelfDeletingTempFile()
+        save_file({"tensor": tensor if tensor.is_contiguous() else tensor.contiguous()}, temp_file.name)
+        return temp_file
+    else:
+        return tensor
+
+
+def partial_disk_unpack(temp_file_or_tensor):
+    if torch.is_tensor(temp_file_or_tensor):
+        return temp_file_or_tensor
+    else:
+        return load_file(temp_file_or_tensor.name, device=device)["tensor"]
 
 
 @torch.inference_mode()
 def run_generate(model, input_ids, pixel_values, do_gc):
     if do_gc:
-        logger.info("Running garbage collection")
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         gc.collect()
@@ -221,11 +242,15 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
         torch.cuda.empty_cache()
         gc.collect()
 
-    if activation_offloading == "cpu":
+    if activation_offloading == "cpu":             # Offload all activations to CPU
         pack_choice, unpack_choice = cpu_pack, cpu_unpack
-    elif activation_offloading == "disk":
+    elif activation_offloading == "disk":          # Offload all activations to disk
         pack_choice, unpack_choice = disk_pack, disk_unpack
-    else:
+    elif activation_offloading == "partial_cpu":   # Offload activations above OFFLOAD_THRESHOLD MB to CPU
+        pack_choice, unpack_choice = partial_cpu_pack, cpu_unpack
+    elif activation_offloading == "partial_disk":  # Offload activations above OFFLOAD_THRESHOLD MB to disk
+        pack_choice, unpack_choice = partial_disk_pack, partial_disk_unpack
+    else:                                          # Keep all activations on GPU/device
         pack_choice, unpack_choice = gpu_pack, gpu_unpack
 
     with torch.autograd.graph.saved_tensors_hooks(pack_choice, unpack_choice):
@@ -744,8 +769,8 @@ def main():
     if config.get("debug"):
         logger.info("DEBUG - Debug mode enabled")
 
-    if config.get("activation_offloading") == "disk":
-        os.makedirs(ACTIVATION_OFFLOAD_DIR, exist_ok=True)
+    if config.get("activation_offloading") in ["disk", "partial_disk"]:
+        os.makedirs(OFFLOAD_DIR, exist_ok=True)
 
     model_dtype = torch.bfloat16 if config.get("use_bf16") else torch.float16
     processor = AutoProcessor.from_pretrained(config.get("model_name"), trust_remote_code=True, padding_side="left")
@@ -826,11 +851,12 @@ def main():
     del train_dataset, val_dataset
 
     logger.info("Loading model")
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(  # TODO: Figure out why this loads so slowly
         config.get("model_name"),
         torch_dtype=model_dtype,
         trust_remote_code=True,
         attn_implementation=config.get("attn_implementation"),
+        device_map=device,
     )
 
     if config.get("freeze_language"):
@@ -849,9 +875,6 @@ def main():
 
     if config.get("gradient_checkpointing"):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
-
-    logger.info(f"Moving model to {device}")
-    model.to(device)
 
     optimizer = prepare_optimizer(
         model.parameters(),
