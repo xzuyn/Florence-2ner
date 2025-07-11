@@ -5,6 +5,7 @@ import math
 import wandb
 import json
 import yaml
+import uuid
 import torch
 import shutil
 import psutil
@@ -26,6 +27,8 @@ Image.MAX_IMAGE_PIXELS = None
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+ACTIVATION_OFFLOAD_DIR = "./TEMP_ACTIVATIONS"
 
 
 def logger_setup(run_name, file_location):
@@ -139,6 +142,105 @@ class LocalImageTextDataset(torch.utils.data.Dataset):
         except Exception as e:
             logger.exception(f"Error loading data from {image_path}: {e}")
             raise
+
+
+class SelfDeletingTempFile:
+    def __init__(self):
+        self.name = os.path.join(ACTIVATION_OFFLOAD_DIR, str(uuid.uuid4()))
+
+    def __del__(self):
+        os.remove(self.name)
+
+
+def gpu_pack(tensor):
+    return tensor
+
+
+def gpu_unpack(tensor):
+    return tensor
+
+
+def cpu_pack(tensor):
+    return tensor.cpu()  # TODO: Add a "partial offload" option
+
+
+def cpu_unpack(tensor):
+    return tensor.to(input_ids.device)
+
+
+def disk_pack(tensor):
+    temp_file = SelfDeletingTempFile()
+    torch.save(tensor, temp_file.name)
+    return temp_file
+
+
+def disk_unpack(temp_file):
+    return torch.load(temp_file.name, weights_only=True)
+
+
+@torch.inference_mode()
+def run_generate(model, input_ids, pixel_values, do_gc):
+    if do_gc:
+        logger.info("Running garbage collection")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    return model.generate(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        max_new_tokens=1024,
+        num_beams=5,
+        min_p=0.05,
+        do_sample=True,
+    )
+
+
+@torch.inference_mode()
+def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
+    if do_gc:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # https://unsloth.ai/blog/gradient
+    batch_token_count = attention_mask.sum()
+    loss_sum = model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        labels=labels,
+        attention_mask=attention_mask,
+    ).loss.mul_(batch_token_count)
+
+    return loss_sum.detach().item(), batch_token_count.item()
+
+
+def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, do_gc, activation_offloading):
+    if do_gc:
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    if activation_offloading == "cpu":
+        pack_choice, unpack_choice = cpu_pack, cpu_unpack
+    elif activation_offloading == "disk":
+        pack_choice, unpack_choice = disk_pack, disk_unpack
+    else:
+        pack_choice, unpack_choice = gpu_pack, gpu_unpack
+
+    with torch.autograd.graph.saved_tensors_hooks(pack_choice, unpack_choice):
+        # https://unsloth.ai/blog/gradient
+        batch_token_count = attention_mask.sum()
+        loss_sum = model(
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            labels=labels,
+            attention_mask=attention_mask,
+        ).loss.mul_(batch_token_count)
+
+    loss_sum.backward()
+
+    return loss_sum.detach().item(), batch_token_count.item()
 
 
 def get_all_files_by_prompt(dataset_config):
@@ -362,82 +464,6 @@ def save_model_checkpoint(model, processor, run_name, train_steps, save_total_li
             shutil.rmtree(checkpoint_to_delete)
 
 
-@torch.inference_mode()
-def run_generate(model, input_ids, pixel_values, do_gc):
-    if do_gc:
-        logger.info("Running garbage collection")
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    return model.generate(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        max_new_tokens=1024,
-        num_beams=5,
-        min_p=0.05,
-        do_sample=True,
-    )
-
-
-@torch.inference_mode()
-def run_forward(model, input_ids, pixel_values, labels, attention_mask, do_gc):
-    if do_gc:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    # https://unsloth.ai/blog/gradient
-    batch_token_count = attention_mask.sum()
-    loss_sum = model(
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        labels=labels,
-        attention_mask=attention_mask,
-    ).loss.mul_(batch_token_count)
-
-    return loss_sum.detach().item(), batch_token_count.item()
-
-
-def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask, do_gc, do_ao):
-    if do_gc:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    # https://unsloth.ai/blog/gradient
-    batch_token_count = attention_mask.sum()
-
-    if do_ao:
-        def pack(tensor):
-            if psutil.virtual_memory().percent > 85:
-                return tensor
-            else:
-                return tensor.cpu()
-
-        def unpack(tensor):
-            return tensor.to(input_ids.device)
-
-        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-            loss_sum = model(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                labels=labels,
-                attention_mask=attention_mask,
-            ).loss.mul_(batch_token_count)
-    else:
-        loss_sum = model(
-            input_ids=input_ids,
-            pixel_values=pixel_values,
-            labels=labels,
-            attention_mask=attention_mask,
-        ).loss.mul_(batch_token_count)
-
-    loss_sum.backward()
-
-    return loss_sum.detach().item(), batch_token_count.item()
-
-
 def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_loader, processor, config, run):
     logger.info("Starting training")
 
@@ -486,7 +512,7 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                 labels=labels,
                 attention_mask=(labels != processor.tokenizer.pad_token_id),  # type: ignore[attr-defined]
                 do_gc=config.get("garbage_collection"),
-                do_ao=config.get("cpu_offload_activations"),
+                activation_offloading=config.get("activation_offloading"),
             )
             window_loss_sum += loss_sum
             window_token_count += token_count
@@ -718,6 +744,9 @@ def main():
     if config.get("debug"):
         logger.info("DEBUG - Debug mode enabled")
 
+    if config.get("activation_offloading") == "disk":
+        os.makedirs(ACTIVATION_OFFLOAD_DIR, exist_ok=True)
+
     model_dtype = torch.bfloat16 if config.get("use_bf16") else torch.float16
     processor = AutoProcessor.from_pretrained(config.get("model_name"), trust_remote_code=True, padding_side="left")
 
@@ -823,7 +852,6 @@ def main():
 
     logger.info(f"Moving model to {device}")
     model.to(device)
-
 
     optimizer = prepare_optimizer(
         model.parameters(),
