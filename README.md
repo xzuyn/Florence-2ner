@@ -1,3 +1,5 @@
+# README is outdated. Needs complete overhaul as well.
+
 # Florence-2ner
 
 This script provides a straightforward way to fine-tune [Microsoft's Florence-2](https://huggingface.co/collections/microsoft/florence-6669f44df0d87d9c3bfb76de) models for image captioning tasks. It's designed to be configurable and integrates with [Weights & Biases](https://wandb.ai/site) for experiment tracking.
