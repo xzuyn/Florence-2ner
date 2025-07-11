@@ -32,6 +32,8 @@ weight_decay: 0.01
 seed: 42
 garbage_collection: false
 activation_offloading:  # cpu or disk or partial_cpu or partial_disk
+offload_threshold_mb:  # used with partial activation offloading. minimum activation size that can be offloaded in mb (default value is 64)
+offload_limit_mb: # used with partial activation offloading. max amount that can be offloaded in mb (default value is 4096)
 
 # Freezing Settings
 freeze_vision: false
