@@ -205,7 +205,9 @@ def partial_cpu_unpack(tensor):
     if tensor.get_device() == -1:
         global CURRENT_OFFLOADED_BYTES
         CURRENT_OFFLOADED_BYTES -= tensor.numel() * tensor.element_size()
-    return tensor.to(device)
+        return tensor.to(device)
+    else:
+        return tensor
 
 
 def disk_unpack(temp_file):
@@ -276,6 +278,7 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
     elif activation_offloading == "partial_disk":
         pack_choice, unpack_choice = partial_disk_pack, partial_disk_unpack
     # Keep all activations on GPU
+    # TODO: verify that this is the same memory usage and speed as not using `saved_tensors_hooks`
     else:
         pack_choice, unpack_choice = gpu_pack, gpu_unpack
 
