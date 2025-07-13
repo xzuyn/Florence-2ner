@@ -189,6 +189,7 @@ def hybrid_pack(tensor):
         save_file({"tensor": tensor if tensor.is_contiguous() else tensor.contiguous()}, temp_file.name)
         return temp_file
 
+
 def gpu_unpack(tensor):
     return tensor
 
@@ -205,12 +206,12 @@ def hybrid_unpack(temp_file_or_tensor):
     if torch.is_tensor(temp_file_or_tensor):
         if temp_file_or_tensor.get_device() == -1:
             global CURRENT_CPU_OFFLOADED_BYTES
-            CURRENT_CPU_OFFLOADED_BYTES -= tensor.numel() * tensor.element_size()
-            return tensor.to(device)
+            CURRENT_CPU_OFFLOADED_BYTES -= temp_file_or_tensor.numel() * temp_file_or_tensor.element_size()
+            return temp_file_or_tensor.to(device)
         else:
             global CURRENT_GPU_BYTES
-            CURRENT_GPU_BYTES -= tensor.numel() * tensor.element_size()
-            return tensor
+            CURRENT_GPU_BYTES -= temp_file_or_tensor.numel() * temp_file_or_tensor.element_size()
+            return temp_file_or_tensor
     else:
         return load_file(temp_file_or_tensor.name, device=device)["tensor"]
 
