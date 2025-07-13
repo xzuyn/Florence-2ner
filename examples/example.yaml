@@ -1,7 +1,7 @@
 # Project Settings
 wandb_project_name: Florence-2-base
 run_name: Florence-2-base-Example-v0.1-run1
-wandb_x_stats_sampling_interval: 1
+wandb_x_stats_sampling_interval: 10  # used for logging system stats every x seconds, default is 10
 
 # Model Settings
 model_name: microsoft/Florence-2-base
