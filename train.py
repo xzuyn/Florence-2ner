@@ -289,25 +289,36 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
     return loss_sum.detach().item(), batch_token_count.item()
 
 
-def get_all_files_by_prompt(dataset_config):
-    """
-    Gather all (prompt, image, text) tuples from multiple directories per task.
-    """
-
+def get_all_files_by_prompt(dataset_dirs):
     all_pairs = []
-    for task_prompt, dirs in dataset_config.items():
-        count = 0
-        for d in dirs:
-            for root, _, files in os.walk(d):
-                for file in files:
-                    if file.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-                        img_file = Path(root) / file
-                        txt_file = img_file.with_suffix(".txt")
-                        if txt_file.exists():
-                            all_pairs.append((task_prompt, img_file, txt_file))
-                            count += 1
+    for main_dir in dataset_dirs:
+        main_path = Path(main_dir)
+        if not main_path.is_dir():
+            logger.warning(f"Skipping non-directory: {main_dir}")
+            continue
 
-        logger.info(f"{task_prompt}: found {count} pairs")
+        # List subdirectories as prompts
+        for prompt_dir in main_path.iterdir():
+            if not prompt_dir.is_dir():
+                continue
+            prompt = prompt_dir.name
+            count = 0
+            # Iterate caption files in prompt subfolder
+            for txt_file in prompt_dir.glob("*.txt"):
+                stem = txt_file.stem
+                # Look for corresponding image in main folder
+                found = False
+                for ext in (".jpg", ".jpeg", ".png", ".webp"):
+                    img_file = main_path / f"{stem}{ext}"
+                    if img_file.exists():
+                        all_pairs.append((prompt, img_file, txt_file))
+                        count += 1
+                        found = True
+                        break
+                if not found:
+                    logger.warning(f"No image found for caption: {txt_file}")
+
+            logger.info(f"{prompt} in {main_path.name}: found {count} pairs")
 
     return all_pairs
 
