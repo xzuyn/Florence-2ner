@@ -30,7 +30,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 OFFLOAD_DIR = "./TEMP_ACTIVATIONS"
-OFFLOAD_GPU_LIMIT_BYTES = 10240 * (1024**2)  # 10GB
+GPU_LIMIT_BYTES = 10240 * (1024**2)  # 10GB
 OFFLOAD_CPU_LIMIT_BYTES = 10240 * (1024**2)  # 10GB
 CURRENT_GPU_BYTES, CURRENT_CPU_OFFLOADED_BYTES = 0, 0
 
@@ -175,11 +175,11 @@ def hybrid_pack(tensor):
 
     tensor_bytes = tensor.numel() * tensor.element_size()
 
-    # Check if current GPU allocation + current tensor size is less than or equal to max GPU allocation, keep it on GPU
-    if CURRENT_GPU_BYTES + tensor_bytes <= OFFLOAD_GPU_LIMIT_BYTES:
+    # if current GPU allocation + current tensor size is less than or equal to max GPU allocation, keep it on GPU
+    if CURRENT_GPU_BYTES + tensor_bytes <= GPU_LIMIT_BYTES:
         CURRENT_GPU_BYTES += tensor_bytes
         return tensor
-    # Check if current CPU allocation + current tensor size is less than or equal to max CPU allocation, move it to CPU
+    # if current CPU allocation + current tensor size is less than or equal to max CPU allocation, move it to CPU
     elif CURRENT_CPU_OFFLOADED_BYTES + tensor_bytes <= OFFLOAD_CPU_LIMIT_BYTES:
         CURRENT_CPU_OFFLOADED_BYTES += tensor_bytes
         return tensor.cpu()
@@ -758,9 +758,9 @@ def main():
     if config.get("activation_offloading") in ["disk", "hybrid"]:
         os.makedirs(OFFLOAD_DIR, exist_ok=True)
 
-    if config.get("offload_threshold_mb"):
-        global OFFLOAD_GPU_LIMIT_BYTES
-        OFFLOAD_GPU_LIMIT_BYTES = config.get("offload_gpu_limit_mb") * (1024**2)
+    if config.get("gpu_limit_mb"):
+        global GPU_LIMIT_BYTES
+        GPU_LIMIT_BYTES = config.get("gpu_limit_mb") * (1024**2)
 
     if config.get("offload_limit_mb"):
         global OFFLOAD_CPU_LIMIT_BYTES
