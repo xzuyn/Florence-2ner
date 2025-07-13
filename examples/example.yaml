@@ -4,7 +4,7 @@ run_name: Florence-2-base-Example-v0.1-run1
 wandb_x_stats_sampling_interval: 10  # used for logging system stats every x seconds, default is 10
 
 # Model Settings
-model_name: PJMixers-Images/Florence-2-base-safetensors
+model_name: microsoft/Florence-2-base
 attn_implementation: sdpa  # sdpa, eager, or flash_attention_2
 use_bf16: true  # true or false, will use fp16 if false
 
