@@ -766,7 +766,7 @@ def main():
         global GPU_LIMIT_BYTES
         GPU_LIMIT_BYTES = config.get("gpu_limit_mb") * (1024**2)
 
-    if config.get("offload_limit_mb"):
+    if config.get("offload_cpu_limit_mb"):
         global OFFLOAD_CPU_LIMIT_BYTES
         OFFLOAD_CPU_LIMIT_BYTES = config.get("offload_cpu_limit_mb") * (1024**2)
 
