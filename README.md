@@ -8,22 +8,26 @@ This script provides a straightforward way to fine-tune [Microsoft's Florence-2]
 
 ## Dataset Format
 
-Same as what you'd use for kohya_ss or OneTrainer. It is recursive, so pairs within subfolders of the folder you select will be seen too.
+Each folder should contain the images, as well as subfolders of captions named using the task prompts. This way you can train multiple tasks on an image, while only needing to have a single copy of the image.
 
 ```
-image_folder
-└── sub_folder
-    └── bleaasdasfads.jpg
+Example1
+└── <CAPTION>
+    └── image_file1.txt
     └── bleaasdasfads.txt
-└── sub_folder2
-    └── fghjtryjt.jpg
     └── fghjtryjt.txt
+    └── blah blah.txt
+    └── asd87sdf78sdfg7.txt
+└── <DETAILED_CAPTION>
+    └── image_file1.txt
+    └── bleaasdasfads.txt
+    └── fghjtryjt.txt
+    └── blah blah.txt
+    └── asd87sdf78sdfg7.txt
 └── image_file1.jpg
-└── image_file1.txt
-└── blah blah.jpg
-└── blah blah.txt
-└── asd87sdf78sdfg7.jpg
-└── asd87sdf78sdfg7.txt
+└── bleaasdasfads.webp
+└── blah blah.png
+└── asd87sdf78sdfg7.jpeg
 ```
 
 The YAML config maps task prompts to lists of folders containing this structure.
@@ -86,10 +90,8 @@ freeze_other: # true or false
 # Dataset Settings
 eval_split: 256
 dataset_config:
-  <CAPTION>:
-    - "/media/xzuyn/NVMe/Datasets/Images/Example-Short"
-  <DETAILED_CAPTION>:
-    - "/media/xzuyn/NVMe/Datasets/Images/Example-Long"
+  - "/media/xzuyn/NVMe/Datasets/Images/Example1"
+  - "/media/xzuyn/NVMe/Datasets/Images/Example2"
 
 # Filtering Settings
 filtering_processes_per_thread: 1
