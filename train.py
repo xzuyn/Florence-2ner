@@ -262,9 +262,9 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
     # Offload all activations to disk
     elif activation_offloading == "disk":
         pack_choice, unpack_choice = disk_pack, disk_unpack
-    # Hold up to GPU_LIMIT_BYTES of activations on GPU,
-    # past that up to OFFLOAD_CPU_LIMIT_BYTES of activations will be offloaded to CPU,
-    # and past that they will be offloaded to disk
+    # Keep up to GPU_LIMIT_BYTES of activations on GPU,
+    # past that offload up to OFFLOAD_CPU_LIMIT_BYTES of activations to CPU,
+    # and past that offloaded to disk
     elif activation_offloading == "hybrid":
         pack_choice, unpack_choice = hybrid_pack, hybrid_unpack
     # Keep all activations on GPU
