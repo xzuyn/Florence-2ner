@@ -1,66 +1,104 @@
 # Florence-2ner
 
-This script provides a straightforward way to fine-tune [Microsoft's Florence-2](https://huggingface.co/collections/microsoft/florence-6669f44df0d87d9c3bfb76de) models for image captioning tasks. It's designed to be configurable and integrates with [Weights & Biases](https://wandb.ai/site) for experiment tracking.
+This script provides a straightforward way to fine-tune [Microsoft's Florence-2](https://huggingface.co/collections/microsoft/florence-6669f44df0d87d9c3bfb76de) models for image captioning tasks.
 
-## Key Features
+## Usage
 
-* **Easy Data Loading:** Handles local image and text file pairs for training in a similar structure to [kohya_ss](https://github.com/bmaltais/kohya_ss).
-* **Gradient Accumulation:** Supports gradient accumulation to train with larger effective batch sizes on limited GPU memory.
-* **Gradient Checkpointing:**  Optionally enables gradient checkpointing to reduce memory usage during training.
-* **Parameter Freezing:** Allows freezing specific parts of the model (vision tower, language model, or other components) for targeted fine-tuning.
-* **Learning Rate Scheduling:** Implements a linear warmup followed by cosine annealing with warm restarts for optimized learning.
-* **Evaluation during Training:** Evaluates the model on a validation set at specified intervals.
-* **Checkpoint Saving:** Saves model checkpoints periodically, with options to limit the number of saved checkpoints.
-* **Weights & Biases Integration:** Seamlessly logs training metrics, validation losses, and generated captions to wandb.
+`python train.py example.yaml`
 
-## Instructions
+## Dataset Format
 
-This script requires a folder containing images and corresponding caption files in plain text format.
+Each folder should contain the images, as well as subfolders of captions named using the task prompts. This way you can train multiple tasks on an image, while only needing to have a single copy of the image.
 
 ```
-dataset_folder
-  └── train  # Optional subdirectory
-      ├── image1.jpg
-      ├── image1.txt
-      ├── another image.webp
-      ├── another image.txt
-      ├── example file name.png
-      └── example file name.txt
+Example1
+└── <CAPTION>
+    └── image_file1.txt
+    └── bleaasdasfads.txt
+    └── fghjtryjt.txt
+    └── blah blah.txt
+    └── asd87sdf78sdfg7.txt
+└── <DETAILED_CAPTION>
+    └── image_file1.txt
+    └── bleaasdasfads.txt
+    └── fghjtryjt.txt
+    └── blah blah.txt
+    └── asd87sdf78sdfg7.txt
+└── image_file1.jpg
+└── bleaasdasfads.webp
+└── blah blah.png
+└── asd87sdf78sdfg7.jpeg
 ```
 
-## Configuration
+The YAML config maps task prompts to lists of folders containing this structure.
 
-The training process is customizable through the `config` dictionary at the beginning of the script:
+## Usage
 
-```python
-config = {
-    "model_name": "microsoft/Florence-2-base",  # The pre-trained Florence-2 model to use
-    "dataset_path": "",                         # Path to your dataset folder
-    "run_name": "",                             # Name for your training run (used for wandb and checkpoints)
-    "epochs": 2,                                # Number of training epochs
-    "learning_rate": 1e-5,                      # Initial learning rate
-    "gradient_checkpointing": True,             # Enable gradient checkpointing to save memory
-    "freeze_vision": True,                      # Freeze the vision encoder
-    "freeze_language": False,                   # Freeze the language model
-    "freeze_other": False,                      # Freeze the rest
-    "train_batch_size": 16,                     # Batch size for training
-    "eval_batch_size": 16,                      # Batch size for evaluation
-    "gradient_accumulation_steps": 16,          # Number of steps for gradient accumulation
-    "clip_grad_norm": 1,                        # Maximum norm for gradient clipping
-    "weight_decay": 1e-5,                       # Weight decay for the optimizer
-    "save_steps": 50,                           # Save a checkpoint every this many steps
-    "save_total_limit": 3,                      # Keep only the last this many checkpoints
-    "eval_steps": 50,                           # Evaluate the model every this many steps
-    "warmup_steps": 50,                         # Number of warmup steps for the learning rate scheduler
-    "eval_split_ratio": 0.1,                    # Ratio of the dataset to use for validation
-    "seed": 42                                  # Random seed for reproducibility
-}
+```bash
+python train_florence2.py config.yaml
 ```
 
-## Checkpoints
+## Example YAML Config
 
-The script saves model checkpoints in the `./checkpoints/<run_name>/` directory. Each checkpoint is saved in a subdirectory named `step-<current_step>`. The `save_total_limit` parameter controls the number of recent checkpoints to keep, automatically deleting older ones.
+```yaml
+# Project Settings
+wandb_project_name: Florence-2-base
+run_name: Florence-2-base-Example-v0.1-run1
+wandb_x_stats_sampling_interval: 10  # used for logging system stats every x seconds, default is 10
 
-## Notes
+# Model Settings
+model_name: microsoft/Florence-2-base
+attn_implementation: sdpa  # sdpa, eager, or flash_attention_2
+use_bf16: true  # true or false, will use fp16 if false
 
-This README was written mainly by `gemini-2.0-flash-thinking-exp-1219`.
+# Save & Eval Settings
+save_steps: 10
+eval_steps: 10
+save_total_limit: 3
+do_extra_eval: true  # true or false
+eval_before_training: true  # true or false
+print_first_batch_predictions: true  # true or false
+
+# Hyperparameter Settings
+epochs: 2
+optimizer: CAME
+lr_scheduler: REX
+learning_rate: 0.0000025
+min_learning_rate: 0.00000025
+train_batch_size: 4
+eval_batch_size: 4
+gradient_accumulation_steps: 16
+gradient_checkpointing: # true or false, may not even work
+warmup_steps: 20
+clip_grad_norm: 0.5
+weight_decay: 0.01
+seed: 42
+garbage_collection: # true or false
+
+# Offloading Settings
+activation_offloading:  # cpu or disk or hybrid
+# used with hybrid activation offloading. max amount that can be kept on gpu (default is 10240 which is 10GB)
+gpu_limit_mb:  
+# used with hybrid activation offloading. max amount that can be moved to cpu (default is 10240 which is 10GB)
+offload_cpu_limit_mb:
+
+# Freezing Settings
+freeze_vision: # true or false
+freeze_language: # true or false
+freeze_other: # true or false
+
+# Dataset Settings
+eval_split: 256
+dataset_config:
+  - "/media/xzuyn/NVMe/Datasets/Images/Example1"
+  - "/media/xzuyn/NVMe/Datasets/Images/Example2"
+
+# Filtering Settings
+filtering_processes_per_thread: 1
+filtering_batch_size: 16
+
+# Dataloader Settings
+dataloader_workers: 12
+persistent_workers: true  # true or false
+dataloader_prefetch_factor: 2
+```
