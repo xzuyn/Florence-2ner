@@ -178,16 +178,14 @@ def hybrid_pack(tensor):
     # if current GPU allocation + current tensor size is less than or equal to max GPU allocation, keep it on GPU
     if CURRENT_GPU_BYTES + tensor_bytes <= GPU_LIMIT_BYTES:
         CURRENT_GPU_BYTES += tensor_bytes
-        return tensor
+        return gpu_pack(tensor)
     # if current CPU allocation + current tensor size is less than or equal to max CPU allocation, move it to CPU
     elif CURRENT_CPU_OFFLOADED_BYTES + tensor_bytes <= OFFLOAD_CPU_LIMIT_BYTES:
         CURRENT_CPU_OFFLOADED_BYTES += tensor_bytes
-        return tensor.cpu()
+        return cpu_pack(tensor)
     # GPU and CPU are past max allocations, move it to disk
     else:
-        temp_file = SelfDeletingTempFile()
-        save_file({"tensor": tensor if tensor.is_contiguous() else tensor.contiguous()}, temp_file.name)
-        return temp_file
+        return disk_pack(tensor)
 
 
 def gpu_unpack(tensor):
@@ -208,12 +206,12 @@ def hybrid_unpack(temp_file_or_tensor):
     if torch.is_tensor(temp_file_or_tensor):
         if temp_file_or_tensor.get_device() == -1:
             CURRENT_CPU_OFFLOADED_BYTES -= temp_file_or_tensor.numel() * temp_file_or_tensor.element_size()
-            return temp_file_or_tensor.to(device)
+            return cpu_unpack(temp_file_or_tensor)
         else:
             CURRENT_GPU_BYTES -= temp_file_or_tensor.numel() * temp_file_or_tensor.element_size()
-            return temp_file_or_tensor
+            return gpu_unpack(temp_file_or_tensor)
     else:
-        return load_file(temp_file_or_tensor.name, device=device)["tensor"]
+        return disk_unpack(temp_file_or_tensor)
 
 
 @torch.inference_mode()
