@@ -203,13 +203,13 @@ def disk_unpack(temp_file):
 
 
 def hybrid_unpack(temp_file_or_tensor):
+    global CURRENT_GPU_BYTES, CURRENT_CPU_OFFLOADED_BYTES
+
     if torch.is_tensor(temp_file_or_tensor):
         if temp_file_or_tensor.get_device() == -1:
-            global CURRENT_CPU_OFFLOADED_BYTES
             CURRENT_CPU_OFFLOADED_BYTES -= temp_file_or_tensor.numel() * temp_file_or_tensor.element_size()
             return temp_file_or_tensor.to(device)
         else:
-            global CURRENT_GPU_BYTES
             CURRENT_GPU_BYTES -= temp_file_or_tensor.numel() * temp_file_or_tensor.element_size()
             return temp_file_or_tensor
     else:
@@ -264,7 +264,9 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
     # Offload all activations to disk
     elif activation_offloading == "disk":
         pack_choice, unpack_choice = disk_pack, disk_unpack
-    # Hold up to x MB of activations on GPU, past that up to y MB of activations will be offloaded to CPU, and past that they will be offloaded to disk.
+    # Hold up to GPU_LIMIT_BYTES of activations on GPU,
+    # past that up to OFFLOAD_CPU_LIMIT_BYTES of activations will be offloaded to CPU,
+    # and past that they will be offloaded to disk
     elif activation_offloading == "hybrid":
         pack_choice, unpack_choice = hybrid_pack, hybrid_unpack
     # Keep all activations on GPU
@@ -721,6 +723,7 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
                 "validation/avg_rougeL": avg_rouge["rougeL"],
             }
         )
+        logger.info(f"{str(wandb_data)}")
 
         del google_bleu_metric, meteor_metric, rouge_metric, all_references, all_predictions
 
