@@ -30,11 +30,9 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 OFFLOAD_DIR = "./TEMP_ACTIVATIONS"
-# Activations above this size will be offloaded
-OFFLOAD_THRESHOLD = 64 * (1024**2)  # 64MB
-# Max size of activations allowed to be offloaded
-OFFLOAD_LIMIT_BYTES = 4096 * (1024**2)  # 4096MB
-CURRENT_OFFLOADED_BYTES = 0
+OFFLOAD_GPU_LIMIT_BYTES = 10240 * (1024**2)  # 10GB
+OFFLOAD_CPU_LIMIT_BYTES = 10240 * (1024**2)  # 10GB
+CURRENT_GPU_BYTES, CURRENT_CPU_OFFLOADED_BYTES = 0, 0
 
 
 def logger_setup(run_name, file_location):
@@ -166,32 +164,30 @@ def cpu_pack(tensor):
     return tensor.cpu()
 
 
-def partial_cpu_pack(tensor):
-    global CURRENT_OFFLOADED_BYTES
-    tensor_bytes = tensor.numel() * tensor.element_size()
-    if (tensor_bytes >= OFFLOAD_THRESHOLD) and (CURRENT_OFFLOADED_BYTES + tensor_bytes <= OFFLOAD_LIMIT_BYTES):
-        CURRENT_OFFLOADED_BYTES += tensor_bytes
-        return tensor.cpu()
-    else:
-        return tensor
-
-
 def disk_pack(tensor):
     temp_file = SelfDeletingTempFile()
     save_file({"tensor": tensor if tensor.is_contiguous() else tensor.contiguous()}, temp_file.name)
     return temp_file
 
 
-def partial_disk_pack(tensor):
-    global CURRENT_OFFLOADED_BYTES
+def hybrid_pack(tensor):
+    global CURRENT_GPU_BYTES, CURRENT_CPU_OFFLOADED_BYTES
+
     tensor_bytes = tensor.numel() * tensor.element_size()
-    if (tensor_bytes >= OFFLOAD_THRESHOLD) and (CURRENT_OFFLOADED_BYTES + tensor_bytes <= OFFLOAD_LIMIT_BYTES):
+
+    # Check if current GPU allocation + current tensor size is less than or equal to max GPU allocation, keep it on GPU
+    if CURRENT_GPU_BYTES + tensor_bytes <= OFFLOAD_GPU_LIMIT_BYTES:
+        CURRENT_GPU_BYTES += tensor_bytes
+        return tensor
+    # Check if current CPU allocation + current tensor size is less than or equal to max CPU allocation, move it to CPU
+    elif CURRENT_CPU_OFFLOADED_BYTES + tensor_bytes <= OFFLOAD_CPU_LIMIT_BYTES:
+        CURRENT_CPU_OFFLOADED_BYTES += tensor_bytes
+        return tensor.cpu()
+    # GPU and CPU are past max allocations, move it to disk
+    else:
         temp_file = SelfDeletingTempFile()
         save_file({"tensor": tensor if tensor.is_contiguous() else tensor.contiguous()}, temp_file.name)
         return temp_file
-    else:
-        return tensor
-
 
 def gpu_unpack(tensor):
     return tensor
@@ -201,25 +197,21 @@ def cpu_unpack(tensor):
     return tensor.to(device)
 
 
-def partial_cpu_unpack(tensor):
-    if tensor.get_device() == -1:
-        global CURRENT_OFFLOADED_BYTES
-        CURRENT_OFFLOADED_BYTES -= tensor.numel() * tensor.element_size()
-        return tensor.to(device)
-    else:
-        return tensor
-
-
 def disk_unpack(temp_file):
     return load_file(temp_file.name, device=device)["tensor"]
 
 
-def partial_disk_unpack(temp_file_or_tensor):
+def hybrid_unpack(temp_file_or_tensor):
     if torch.is_tensor(temp_file_or_tensor):
-        return temp_file_or_tensor
+        if temp_file_or_tensor.get_device() == -1:
+            global CURRENT_CPU_OFFLOADED_BYTES
+            CURRENT_CPU_OFFLOADED_BYTES -= tensor.numel() * tensor.element_size()
+            return tensor.to(device)
+        else:
+            global CURRENT_GPU_BYTES
+            CURRENT_GPU_BYTES -= tensor.numel() * tensor.element_size()
+            return tensor
     else:
-        global CURRENT_OFFLOADED_BYTES
-        CURRENT_OFFLOADED_BYTES -= tensor.numel() * tensor.element_size()
         return load_file(temp_file_or_tensor.name, device=device)["tensor"]
 
 
@@ -271,12 +263,9 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
     # Offload all activations to disk
     elif activation_offloading == "disk":
         pack_choice, unpack_choice = disk_pack, disk_unpack
-    # Offload activations above OFFLOAD_THRESHOLD to CPU, up to a maximum of CURRENT_OFFLOADED_BYTES
-    elif activation_offloading == "partial_cpu":
-        pack_choice, unpack_choice = partial_cpu_pack, partial_cpu_unpack
-    # Offload activations above OFFLOAD_THRESHOLD to disk, up to a maximum of CURRENT_OFFLOADED_BYTES
-    elif activation_offloading == "partial_disk":
-        pack_choice, unpack_choice = partial_disk_pack, partial_disk_unpack
+    # Hold up to x MB of activations on GPU, past that up to y MB of activations will be offloaded to CPU, and past that they will be offloaded to disk.
+    elif activation_offloading == "hybrid":
+        pack_choice, unpack_choice = hybrid_pack, hybrid_unpack
     # Keep all activations on GPU
     # TODO: verify that this is the same memory usage and speed as not using `saved_tensors_hooks`
     else:
@@ -743,8 +732,6 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
 
 
 def main():
-    global OFFLOAD_THRESHOLD, OFFLOAD_LIMIT_BYTES
-
     parser = argparse.ArgumentParser(
         description="A simple Florence-2 finetuning script."
     )
@@ -768,14 +755,16 @@ def main():
     logger_setup(config.get("run_name"), output_base_dir)
     logger.info(str(config))
 
-    if config.get("activation_offloading") in ["disk", "partial_disk"]:
+    if config.get("activation_offloading") in ["disk", "hybrid"]:
         os.makedirs(OFFLOAD_DIR, exist_ok=True)
 
     if config.get("offload_threshold_mb"):
-        OFFLOAD_THRESHOLD = config.get("offload_threshold_mb") * (1024**2)
+        global OFFLOAD_GPU_LIMIT_BYTES
+        OFFLOAD_GPU_LIMIT_BYTES = config.get("offload_gpu_limit_mb") * (1024**2)
 
     if config.get("offload_limit_mb"):
-        OFFLOAD_LIMIT_BYTES = config.get("offload_limit_mb") * (1024**2)
+        global OFFLOAD_CPU_LIMIT_BYTES
+        OFFLOAD_CPU_LIMIT_BYTES = config.get("offload_cpu_limit_mb") * (1024**2)
 
     model_dtype = torch.bfloat16 if config.get("use_bf16") else torch.float16
     processor = AutoProcessor.from_pretrained(config.get("model_name"), trust_remote_code=True, padding_side="left")
@@ -879,6 +868,7 @@ def main():
         model.image_projection.requires_grad = False
 
     if config.get("gradient_checkpointing"):
+        # TODO: Find out why this is or isn't working
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
 
     optimizer = prepare_optimizer(
