@@ -282,6 +282,8 @@ def run_forward_backward(model, input_ids, pixel_values, labels, attention_mask,
             attention_mask=attention_mask,
         ).loss.mul_(batch_token_count)
 
+    # logger.info(f"DEBUG - Activations were offloaded to CPU: {(CURRENT_CPU_OFFLOADED_BYTES / (1024**2)):.2f}MB")
+
     loss_sum.backward()
 
     return loss_sum.detach().item(), batch_token_count.item()
@@ -300,6 +302,11 @@ def get_all_files_by_prompt(dataset_dirs):
             if not prompt_dir.is_dir():
                 continue
             prompt = prompt_dir.name
+            if prompt not in ["<CAPTION>", "<DETAILED_CAPTION>", "<MORE_DETAILED_CAPTION>"]:
+                logger.warning(
+                    f"'{prompt}' is invalid. Task must be '<CAPTION>', '<DETAILED_CAPTION>', or '<MORE_DETAILED_CAPTION>'"
+                )
+                continue
             count = 0
             # Iterate caption files in prompt subfolder
             for txt_file in prompt_dir.glob("*.txt"):
@@ -515,6 +522,7 @@ def save_model_checkpoint(model, processor, run_name, train_steps, save_total_li
         for checkpoint_to_delete in checkpoints[:num_to_delete]:
             logger.info(f"Deleting old checkpoint: {checkpoint_to_delete}")
             shutil.rmtree(checkpoint_to_delete)
+    # TODO: Add a push_to_hub option
 
 
 def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_loader, processor, config, run):
@@ -749,6 +757,7 @@ def main():
         description="A simple Florence-2 finetuning script."
     )
 
+    # TODO: Add config options as optional arguments and make yaml optional
     parser.add_argument(
         "yaml_file",
         type=str,
@@ -762,7 +771,7 @@ def main():
         config = yaml.safe_load(f)
 
     # Prepare output directory
-    output_base_dir = Path(f"./checkpoints/{config['run_name']}")
+    output_base_dir = Path(f"./checkpoints/{config.get('run_name')}")
     output_base_dir.mkdir(parents=True, exist_ok=True)
 
     logger_setup(config.get("run_name"), output_base_dir)
@@ -797,7 +806,7 @@ def main():
 
     logger.info(
         f"Filtering data based on token length using {processes_count} processes "
-        f"and batch size {int(config['filtering_batch_size'])}"
+        f"and batch size {int(config.get('filtering_batch_size'))}"
     )
     filtered_pairs = filter_all_pairs(all_pairs, processor, processes_count, int(config.get("filtering_batch_size")))
     logger.info(f"Filtered out {len(all_pairs) - len(filtered_pairs)} files due to token length.")
