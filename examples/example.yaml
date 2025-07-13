@@ -5,7 +5,7 @@ wandb_x_stats_sampling_interval: 10  # used for logging system stats every x sec
 
 # Model Settings
 model_name: microsoft/Florence-2-base
-attn_implementation: sdpa
+attn_implementation: sdpa  # sdpa, eager, or flash_attention_2
 use_bf16: true  # true or false, will use fp16 if false
 
 # Save & Eval Settings
