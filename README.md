@@ -40,20 +40,20 @@ python train_florence2.py config.yaml
 # Project Settings
 wandb_project_name: Florence-2-base
 run_name: Florence-2-base-Example-v0.1-run1
-wandb_x_stats_sampling_interval: 1
+wandb_x_stats_sampling_interval: 10  # used for logging system stats every x seconds, default is 10
 
 # Model Settings
 model_name: microsoft/Florence-2-base
-attn_implementation: sdpa
-use_bf16: true
+attn_implementation: sdpa  # sdpa, eager, or flash_attention_2
+use_bf16: true  # true or false, will use fp16 if false
 
 # Save & Eval Settings
 save_steps: 10
 eval_steps: 10
 save_total_limit: 3
-do_extra_eval: true
-eval_before_training: true
-print_first_batch_predictions: true
+do_extra_eval: true  # true or false
+eval_before_training: true  # true or false
+print_first_batch_predictions: true  # true or false
 
 # Hyperparameter Settings
 epochs: 2
@@ -64,20 +64,24 @@ min_learning_rate: 0.00000025
 train_batch_size: 4
 eval_batch_size: 4
 gradient_accumulation_steps: 16
-gradient_checkpointing: true
+gradient_checkpointing: # true or false, may not even work
 warmup_steps: 20
 clip_grad_norm: 0.5
 weight_decay: 0.01
 seed: 42
-garbage_collection: false
-activation_offloading:  # cpu or disk or partial_cpu or partial_disk
-offload_threshold_mb:  # used with partial activation offloading. minimum activation size that can be offloaded in mb (default value is 64)
-offload_limit_mb: # used with partial activation offloading. max amount that can be offloaded in mb (default value is 4096)
+garbage_collection: # true or false
+
+# Offloading Settings
+activation_offloading:  # cpu or disk or hybrid
+# used with hybrid activation offloading. max amount that can be kept on gpu (default is 10240 which is 10GB)
+gpu_limit_mb:  
+# used with hybrid activation offloading. max amount that can be moved to cpu (default is 10240 which is 10GB)
+offload_cpu_limit_mb:
 
 # Freezing Settings
-freeze_vision: false
-freeze_language: false
-freeze_other: false
+freeze_vision: # true or false
+freeze_language: # true or false
+freeze_other: # true or false
 
 # Dataset Settings
 eval_split: 256
@@ -93,9 +97,6 @@ filtering_batch_size: 16
 
 # Dataloader Settings
 dataloader_workers: 12
-persistent_workers: true
+persistent_workers: true  # true or false
 dataloader_prefetch_factor: 2
-
-# Debug
-debug: false
 ```
