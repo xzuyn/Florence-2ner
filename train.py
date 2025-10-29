@@ -1,6 +1,5 @@
 import os
 import gc
-import re
 import math
 import wandb
 import json
@@ -8,14 +7,13 @@ import yaml
 import uuid
 import torch
 import shutil
-import psutil
 import random
 import logging
 import argparse
 import evaluate
 import multiprocessing
 
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import Florence2ForConditionalGeneration, AutoProcessor
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
@@ -54,71 +52,66 @@ def logger_setup(run_name, file_location):
 # https://github.com/IvanVassi/REX_LR
 class RexLR(torch.optim.lr_scheduler.LRScheduler):
     """
-    Reflected Exponential (REX) learning rate scheduler.
-
-    - Original implementation: https://github.com/IvanVassi/REX_LR
-    - Original license: Apache 2.0
-    - Based on: https://arxiv.org/abs/2107.04197
+    Reflected Exponential (REX) learning rate scheduler (https://arxiv.org/abs/2107.04197)
+    Modified from: https://github.com/IvanVassi/REX_LR (Apache-2.0 License)
 
     Args:
-        optimizer (torch.optim.Optimizer): The optimizer to schedule the learning rate for.
-        max_lr (float): The maximum learning rate.
-        min_lr (float): The minimum learning rate.
-        total_steps (int): The total number of training steps.
-        num_warmup_steps (int): The number of warmup steps.
-        last_step (int): The index of last step.
+        optimizer (torch.optim.Optimizer): The optimizer to schedule the learning rate for
+        max_lr (float): The maximum learning rate
+        min_lr (float): The minimum learning rate
+        num_steps (int): The total number of training steps
+        num_warmup_steps (int): The number of warmup steps
+        rex_alpha (float): Constant added to the denominator of the REX factor;
+            prevents division-by-zero and softens the initial decay (default: 0.1).
+        rex_beta (float): Multiplier of z in the denominator of the REX factor;
+            controls how quickly the decay flattens as z increases (default: 0.9).
+        last_epoch (int): The index of the last step
     """
 
-    def __init__(self, optimizer, max_lr, min_lr, total_steps=0, num_warmup_steps=0, last_step=0):
+    def __init__(self, optimizer, max_lr, min_lr=0.0, num_steps=0, num_warmup_steps=0, rex_alpha=0.1, rex_beta=0.9, last_epoch=-1):
         if min_lr > max_lr:
-            raise ValueError(
-                f'Value of "min_lr" should be less than value of "max_lr". Got min_lr={min_lr} and max_lr={max_lr}'
-            )
-        if num_warmup_steps > total_steps:
-            raise ValueError(
-                f"num_warmup_steps ({num_warmup_steps}) must be less than or equal to total_steps ({total_steps})."
-            )
+            raise ValueError(f'Value of "min_lr" should be less than value of "max_lr". Got min_lr={min_lr} and max_lr={max_lr}')
+        if num_warmup_steps > num_steps:
+            raise ValueError(f"num_warmup_steps ({num_warmup_steps}) must be less than or equal to num_steps ({num_steps})")
 
         self.min_lr = min_lr
         self.max_lr = max_lr
-        self.total_steps = total_steps
+        self.num_steps = num_steps
         self.num_warmup_steps = num_warmup_steps
-        self.last_step = max(last_step - 1, 0)
+        self.rex_alpha = rex_alpha
+        self.rex_beta = rex_beta
+        self.last_epoch = last_epoch
 
-        # Ensure each parameter group has an "initial_lr" key to avoid issues when resuming.
+        # Ensure each parameter group has an "initial_lr" key to avoid issues when resuming
         for group in optimizer.param_groups:
             group.setdefault("initial_lr", group["lr"])
 
-        # Pass self.last_step as last_epoch to the parent.
-        super().__init__(optimizer, last_epoch=self.last_step)
-
-    @property
-    def last_step(self):
-        return self.last_epoch
-
-    @last_step.setter
-    def last_step(self, value):
-        self.last_epoch = value
+        super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
-        # Warmup phase: if defined, increase lr linearly from 0 to max_lr.
-        if 1 <= self.last_step <= self.num_warmup_steps:
+        # Single warmup step
+        if self.num_warmup_steps == 1 and self.last_epoch == 1:
+            return [self.min_lr for _ in self.base_lrs]
+        # Multiple warmup steps; increase lr linearly from min_lr to max_lr
+        elif self.num_warmup_steps > 1 and 1 <= self.last_epoch <= (self.num_warmup_steps - 1):
             return [
-                base_lr * self.last_step / self.num_warmup_steps
-                for base_lr in self.base_lrs
+                self.min_lr + (self.max_lr - self.min_lr) * (self.last_epoch - 1) / (self.num_warmup_steps - 1)
+                for _ in self.base_lrs
             ]
 
-        # Post-warmup phase: adjust step relative to the end of warmup.
-        step_after = self.last_step - self.num_warmup_steps
-        remaining_steps = self.total_steps - self.num_warmup_steps
+        # Post-warmup phase: adjust step relative to the end of warmup
+        step_after = self.last_epoch - self.num_warmup_steps
+        remaining_steps = self.num_steps - self.num_warmup_steps
 
         # Avoid LR spiking
         if step_after >= remaining_steps or step_after == -1 or remaining_steps <= 0:
             return [self.min_lr for _ in self.base_lrs]
 
-        mod_iter = step_after % remaining_steps
-        z = (remaining_steps - mod_iter) / remaining_steps
-        rex_factor = self.min_lr / self.max_lr + (1.0 - self.min_lr / self.max_lr) * (z / (0.1 + 0.9 * z))
+        # Calculate REX curve for current step
+        rex_z = (remaining_steps - (step_after % remaining_steps)) / remaining_steps
+        rex_factor = self.min_lr / self.max_lr + (1.0 - self.min_lr / self.max_lr) * (
+            rex_z / (self.rex_alpha + self.rex_beta * rex_z)
+        )
 
         return [base_lr * rex_factor for base_lr in self.base_lrs]
 
@@ -410,6 +403,7 @@ def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_
         except ImportError:
             logger.exception("You do not have optimī installed. Please install it using `pip install torch-optimi`")
             raise
+    # TODO: Add fused backward pass support
     elif optimizer_name == "CAME":
         try:
             from came_pytorch import CAME
@@ -460,7 +454,7 @@ def prepare_lr_scheduler(
             optimizer=scheduler_optimizer,
             max_lr=scheduler_lr,
             min_lr=scheduler_min_lr,
-            total_steps=scheduler_total_training_steps,
+            num_steps=scheduler_total_training_steps,
             num_warmup_steps=scheduler_warmup_steps
         )
     else:
@@ -500,13 +494,6 @@ def save_model_checkpoint(model, processor, run_name, train_steps, save_total_li
     model.save_pretrained(output_dir)
     processor.save_pretrained(output_dir)
 
-    # Workaround for vision_config
-    with open(f"{output_dir}/config.json", "r") as f:
-        data = json.load(f)
-    data["vision_config"]["model_type"] = "davit"
-    with open(f"{output_dir}/config.json", "w") as f:
-        json.dump(data, f, indent=2)
-
     # Implement save_total_limit
     checkpoint_dir = Path(f"./checkpoints/{run_name}")
     checkpoints = sorted(checkpoint_dir.glob("step-*"), key=lambda x: int(x.name.split('-')[-1]))
@@ -544,7 +531,7 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                 return_tensors="pt",
                 padding="longest",
                 truncation=False,
-                pad_to_multiple_of=16,
+                pad_to_multiple_of=16,  # TODO: Make adjustable?
                 return_token_type_ids=False,
             ).input_ids.to(device)
 
@@ -651,7 +638,7 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
             text=answers,
             return_tensors="pt",
             padding="longest",
-            pad_to_multiple_of=16,
+            pad_to_multiple_of=16,  # TODO: Make adjustable?
             truncation=False,
         ).input_ids.to(device)
 
@@ -780,7 +767,7 @@ def main():
         OFFLOAD_CPU_LIMIT_BYTES = config.get("offload_cpu_limit_mb") * (1024**2)
 
     model_dtype = torch.bfloat16 if config.get("use_bf16") else torch.float16
-    processor = AutoProcessor.from_pretrained(config.get("model_name"), trust_remote_code=True, padding_side="left")
+    processor = AutoProcessor.from_pretrained(config.get("model_name"), padding_side="left")  # TODO: Verify padding should be left
 
     random.seed(config.get("seed"))
     torch.manual_seed(config.get("seed"))
@@ -842,7 +829,7 @@ def main():
         shuffle=True,
         num_workers=int(config.get("dataloader_workers")) or os.cpu_count(),
         persistent_workers=config.get("persistent_workers"),
-        pin_memory=True,
+        pin_memory=True,  # Depreciated?
         prefetch_factor=int(config.get("dataloader_prefetch_factor")),
     )
     val_loader = torch.utils.data.DataLoader(
@@ -851,21 +838,21 @@ def main():
         collate_fn=partial(collate_fn, processor=processor),
         num_workers=int(config.get("dataloader_workers")) or os.cpu_count(),
         persistent_workers=config.get("persistent_workers"),
-        pin_memory=True,
+        pin_memory=True,  # Depreciated?
         prefetch_factor=int(config.get("dataloader_prefetch_factor")),
     )
 
     del train_dataset, val_dataset
 
     logger.info("Loading model")
-    model = AutoModelForCausalLM.from_pretrained(  # TODO: Figure out why this loads so slowly
+    model = Florence2ForConditionalGeneration.from_pretrained(  # TODO: Figure out why this loads so slowly
         config.get("model_name"),
-        torch_dtype=model_dtype,
-        trust_remote_code=True,
+        dtype=model_dtype,
         attn_implementation=config.get("attn_implementation"),
         device_map=device,
     )
 
+    # TODO: Verify the keys are the same on new transformers
     if config.get("freeze_language"):
         for param in model.language_model.parameters():
             param.requires_grad = False
@@ -882,6 +869,7 @@ def main():
 
     if config.get("gradient_checkpointing"):
         # TODO: Find out why this is or isn't working
+        # Now that florence-2 is added to transformers, this'll work?
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
 
     optimizer = prepare_optimizer(
