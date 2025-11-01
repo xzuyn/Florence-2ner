@@ -404,6 +404,8 @@ def prepare_optimizer(model_parameters, optimizer_name, optimizer_lr, optimizer_
             logger.exception("You do not have optimī installed. Please install it using `pip install torch-optimi`")
             raise
     # TODO: Add fused backward pass support
+    #       Reference: https://github.com/xzuyn/musubi-tuner/commit/54cda30b55a27fb3e5219629b021b7cfc40b6fce
+    #                  https://docs.pytorch.org/tutorials/intermediate/optimizer_step_in_backward_tutorial.html
     elif optimizer_name == "CAME":
         try:
             from came_pytorch import CAME
@@ -533,11 +535,11 @@ def train_model(model, model_dtype, optimizer, scheduler, train_loader, val_load
                 truncation=False,
                 pad_to_multiple_of=16,  # TODO: Make adjustable?
                 return_token_type_ids=False,
-            ).input_ids.to(device)
+            ).input_ids.to(device, non_blocking=True)
 
             # Move inputs to device and cast pixel_values to bf16 or fp16
-            inputs = inputs.to(device)
-            inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
+            inputs = inputs.to(device, non_blocking=True)
+            inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype, non_blocking=True)
 
             loss_sum, token_count = run_forward_backward(
                 model=model,
@@ -640,11 +642,11 @@ def evaluate_model(model, model_dtype, val_loader, processor, config, run, train
             padding="longest",
             pad_to_multiple_of=16,  # TODO: Make adjustable?
             truncation=False,
-        ).input_ids.to(device)
+        ).input_ids.to(device, non_blocking=True)
 
         # Move inputs to device and cast pixel_values to bf16 or fp16
-        inputs = inputs.to(device)
-        inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype)
+        inputs = inputs.to(device, non_blocking=True)
+        inputs["pixel_values"] = inputs["pixel_values"].to(model_dtype, non_blocking=True)
 
         eval_loss_sum, eval_token_count = run_forward(
             model=model,
@@ -775,6 +777,7 @@ def main():
         torch.cuda.manual_seed_all(config.get("seed"))
 
     # Gather and filter data
+    # TODO: Move all preprocessing and such to its own file, and add ability to cache (as safetensors?)
     logger.info("Gathering files from multiple datasets...")
     all_pairs = get_all_files_by_prompt(config.get("dataset_config"))
 
